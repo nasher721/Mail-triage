@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "email-triage-python"
+version = "0.1.0"
+description = "Review-only Outlook email screening with Microsoft Graph and OpenAI structured outputs"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+email-triage = "email_triage.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

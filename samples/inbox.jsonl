@@ -1,0 +1,3 @@
+{"id": "local-1", "subject": "Availability next Tuesday", "sender_name": "Alex Rivera", "sender_address": "alex@example.org", "body": "Hi Nick,\n\nCan we meet next Tuesday afternoon to review the project timeline? Please confirm what time works.\n\nThanks,\nAlex", "has_attachments": false}
+{"id": "local-2", "subject": "Weekly newsletter", "sender_name": "Updates", "sender_address": "no-reply@example.org", "body": "Here is this week's roundup of announcements. No response is required.", "has_attachments": false}
+{"id": "local-3", "subject": "FYI: office closed Friday", "sender_name": "Operations", "sender_address": "ops@example.org", "body": "The office will be closed this Friday. No action is needed unless you already had meetings booked.", "has_attachments": false}
