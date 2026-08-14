@@ -4,6 +4,7 @@ import json
 import os
 import time
 from datetime import datetime
+from html import escape
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -14,7 +15,10 @@ from email_triage.models import GraphMessage
 
 
 GRAPH_ROOT = "https://graph.microsoft.com/v1.0"
-SCOPES = "openid offline_access https://graph.microsoft.com/Mail.Read"
+READ_SCOPES = "openid offline_access https://graph.microsoft.com/Mail.Read"
+#: Mail.ReadWrite covers folders, categories, and draft creation. Mail.Send is never
+#: requested, so this application cannot send mail even if it were asked to.
+READ_WRITE_SCOPES = "openid offline_access https://graph.microsoft.com/Mail.ReadWrite"
 
 
 class GraphError(RuntimeError):
@@ -22,10 +26,21 @@ class GraphError(RuntimeError):
 
 
 class GraphMailbox:
-    def __init__(self, tenant_id: str, client_id: str, cache_path: Path):
+    def __init__(
+        self,
+        tenant_id: str,
+        client_id: str,
+        cache_path: Path,
+        read_write: bool = False,
+        interactive: bool = True,
+    ):
         self.tenant_id = tenant_id
         self.client_id = client_id
         self.cache_path = cache_path
+        self.scopes = READ_WRITE_SCOPES if read_write else READ_SCOPES
+        #: Scheduled runs set this False so a run never blocks on a device-code prompt.
+        self.interactive = interactive
+        self._folder_ids: dict[str, str] = {}
 
     def _token_url(self, path: str) -> str:
         return f"https://login.microsoftonline.com/{self.tenant_id}/oauth2/v2.0/{path}"
@@ -65,12 +80,16 @@ class GraphMailbox:
             "access_token": token.get("access_token"),
             "refresh_token": token.get("refresh_token"),
             "expires_at": int(time.time()) + int(token.get("expires_in", 0)),
+            "scopes": self.scopes,
         }
         self.cache_path.write_text(json.dumps(cached), encoding="utf-8")
         os.chmod(self.cache_path, 0o600)
 
     def access_token(self) -> str:
         cached = self._load_cache()
+        # A cached token issued for narrower scopes cannot authorize write calls.
+        if cached.get("scopes", READ_SCOPES) != self.scopes:
+            cached = {}
         if cached.get("access_token") and int(cached.get("expires_at", 0)) > time.time() + 120:
             return str(cached["access_token"])
         if cached.get("refresh_token"):
@@ -80,7 +99,7 @@ class GraphMailbox:
                     "client_id": self.client_id,
                     "grant_type": "refresh_token",
                     "refresh_token": str(cached["refresh_token"]),
-                    "scope": SCOPES,
+                    "scope": self.scopes,
                 },
             )
             if refreshed.get("access_token"):
@@ -88,9 +107,16 @@ class GraphMailbox:
                 self._save_cache(refreshed)
                 return str(refreshed["access_token"])
 
+        if not self.interactive:
+            raise GraphError(
+                "No usable cached Microsoft credential. Sign in once from a terminal with "
+                "`email-triage --login` (add --apply for read-write scope); scheduled runs "
+                "then refresh silently."
+            )
+
         flow = self._post_form(
             self._token_url("devicecode"),
-            {"client_id": self.client_id, "scope": SCOPES},
+            {"client_id": self.client_id, "scope": self.scopes},
         )
         if "device_code" not in flow:
             raise GraphError("Microsoft device authorization could not be started")
@@ -155,6 +181,114 @@ class GraphMailbox:
                     break
             url = payload.get("@odata.nextLink")
         return messages
+
+    # --- write operations (require read_write=True) -------------------------------
+
+    def _json_request(
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if self.scopes != READ_WRITE_SCOPES:
+            raise GraphError("write operations require a read-write Graph session")
+        request = Request(
+            f"{GRAPH_ROOT}{path}",
+            data=json.dumps(payload).encode("utf-8") if payload is not None else None,
+            headers={
+                "Authorization": f"Bearer {self.access_token()}",
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+            method=method,
+        )
+        try:
+            with urlopen(request, timeout=30) as response:
+                body = response.read()
+                return json.loads(body) if body else {}
+        except HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:400]
+            raise GraphError(f"Microsoft Graph {method} {path} failed ({exc.code}): {detail}") from exc
+        except (URLError, TimeoutError, json.JSONDecodeError) as exc:
+            raise GraphError(f"Microsoft Graph {method} {path} failed") from exc
+
+    def ensure_folder_path(self, folder_path: str) -> str:
+        """Create or reuse a nested mail folder such as 'AI Triage/Needs Reply'."""
+
+        if folder_path in self._folder_ids:
+            return self._folder_ids[folder_path]
+        parent = "inbox"
+        walked = ""
+        for segment in [part.strip() for part in folder_path.split("/") if part.strip()]:
+            walked = f"{walked}/{segment}" if walked else segment
+            cached = self._folder_ids.get(walked)
+            if cached:
+                parent = cached
+                continue
+            escaped = segment.replace("'", "''")
+            query = urlencode(
+                {"$filter": f"displayName eq '{escaped}'", "$select": "id,displayName", "$top": "10"}
+            )
+            found = self._json_request("GET", f"/me/mailFolders/{parent}/childFolders?{query}")
+            matches = [
+                item
+                for item in found.get("value", [])
+                if item.get("displayName") == segment and item.get("id")
+            ]
+            if matches:
+                folder_id = str(matches[0]["id"])
+            else:
+                created = self._json_request(
+                    "POST",
+                    f"/me/mailFolders/{parent}/childFolders",
+                    {"displayName": segment},
+                )
+                folder_id = str(created.get("id") or "")
+                if not folder_id:
+                    raise GraphError(f"Microsoft Graph did not return an id for folder {segment!r}")
+            self._folder_ids[walked] = folder_id
+            parent = folder_id
+        return parent
+
+    def update_message(
+        self,
+        message_id: str,
+        categories: tuple[str, ...] | None = None,
+        is_read: bool | None = None,
+    ) -> None:
+        payload: dict[str, Any] = {}
+        if categories is not None:
+            payload["categories"] = list(categories)
+        if is_read is not None:
+            payload["isRead"] = is_read
+        if not payload:
+            return
+        self._json_request("PATCH", f"/me/messages/{message_id}", payload)
+
+    def create_reply_draft(self, message_id: str, reply_text: str) -> str:
+        """Create an unsent reply draft. This never sends; no Mail.Send scope is held."""
+
+        draft = self._json_request(
+            "POST",
+            f"/me/messages/{message_id}/createReply",
+            {"comment": _text_to_html(reply_text)},
+        )
+        return str(draft.get("id") or "")
+
+    def move_message(self, message_id: str, folder_id: str) -> str:
+        """Move a message and return its new identifier."""
+
+        moved = self._json_request(
+            "POST",
+            f"/me/messages/{message_id}/move",
+            {"destinationId": folder_id},
+        )
+        return str(moved.get("id") or message_id)
+
+
+def _text_to_html(text: str) -> str:
+    lines = escape(text).splitlines() or [""]
+    return "<div>" + "<br>".join(lines) + "</div>"
 
 
 def _parse_message(raw: dict[str, Any]) -> GraphMessage:

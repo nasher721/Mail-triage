@@ -46,9 +46,9 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(settings.mailbox_source, "local")
         self.assertEqual(settings.input_path, Path("samples/inbox.jsonl"))
 
-    def test_missing_graph_explains_local_workaround(self) -> None:
+    def test_missing_graph_explains_owa_and_local_workarounds(self) -> None:
         with patch.dict("os.environ", {"TRIAGE_BACKEND": "ollama"}, clear=True):
-            with self.assertRaisesRegex(ConfigurationError, "--input"):
+            with self.assertRaisesRegex(ConfigurationError, "--owa"):
                 Settings.from_env()
 
     def test_remote_ollama_requires_approval(self) -> None:

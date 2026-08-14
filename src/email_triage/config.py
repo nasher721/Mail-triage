@@ -57,20 +57,43 @@ class Settings:
     intercept_clinical: bool
     mailbox_source: str
     input_path: Path | None
+    owa_cdp_url: str
     max_unread_messages: int
     max_body_characters: int
     output_dir: Path
+    apply_changes: bool = False
+    mark_read: bool = False
+    use_agent: bool = True
 
     @property
     def uses_local_inference(self) -> bool:
         return self.ai_backend == "ollama" and is_loopback_url(self.ollama_host)
 
     @classmethod
-    def from_env(cls, input_path: str | None = None) -> "Settings":
+    def from_env(
+        cls,
+        input_path: str | None = None,
+        apply_changes: bool | None = None,
+        mark_read: bool | None = None,
+        use_agent: bool | None = None,
+        source: str | None = None,
+    ) -> "Settings":
         resolved_input = (input_path or os.getenv("TRIAGE_INPUT", "")).strip()
         tenant_id = os.getenv("MS_TENANT_ID", "").strip()
         client_id = os.getenv("MS_CLIENT_ID", "").strip()
-        mailbox_source = "local" if resolved_input else "graph"
+        requested_source = (source or os.getenv("TRIAGE_SOURCE", "")).strip().lower()
+        if requested_source and requested_source not in {"graph", "local", "owa"}:
+            raise ConfigurationError("TRIAGE_SOURCE must be graph, local, or owa")
+        if requested_source:
+            mailbox_source = requested_source
+        elif resolved_input:
+            mailbox_source = "local"
+        else:
+            mailbox_source = "graph"
+        if mailbox_source == "local" and not resolved_input:
+            raise ConfigurationError(
+                "Local source needs --input or TRIAGE_INPUT pointing at JSONL/JSON/.eml files."
+            )
         if mailbox_source == "graph":
             missing_graph = [
                 name
@@ -79,8 +102,9 @@ class Settings:
             ]
             if missing_graph:
                 raise ConfigurationError(
-                    "Microsoft Graph is not configured. Pass --input path/to/messages.jsonl "
-                    "to screen local files without Entra access, or set MS_TENANT_ID and "
+                    "Microsoft Graph is not configured. For Outlook already open in Edge, "
+                    "run with --owa (no admin app). To screen exported files, pass "
+                    "--input path/to/messages.jsonl. To use Graph, set MS_TENANT_ID and "
                     "MS_CLIENT_ID."
                 )
 
@@ -116,6 +140,21 @@ class Settings:
         else:
             approved = False
 
+        apply_enabled = _bool("TRIAGE_APPLY") if apply_changes is None else apply_changes
+        mark_read_enabled = _bool("TRIAGE_MARK_READ") if mark_read is None else mark_read
+        agent_enabled = _bool("TRIAGE_AGENT", True) if use_agent is None else use_agent
+        if apply_enabled and mailbox_source == "local":
+            raise ConfigurationError(
+                "--apply writes to the live Outlook mailbox and cannot be combined "
+                "with --input. Use --owa --apply for Outlook in Edge, or drop --apply "
+                "to preview a local file."
+            )
+        owa_cdp_url = (
+            os.getenv("EDGE_CDP_URL", "").strip()
+            or os.getenv("OWA_CDP_URL", "").strip()
+            or "http://127.0.0.1:9222"
+        )
+
         return cls(
             tenant_id=tenant_id,
             client_id=client_id,
@@ -128,7 +167,11 @@ class Settings:
             intercept_clinical=not local_inference,
             mailbox_source=mailbox_source,
             input_path=Path(resolved_input).expanduser() if resolved_input else None,
+            owa_cdp_url=owa_cdp_url.rstrip("/"),
             max_unread_messages=_positive_int("MAX_UNREAD_MESSAGES", 20),
             max_body_characters=_positive_int("MAX_BODY_CHARACTERS", 12_000),
             output_dir=Path(os.getenv("TRIAGE_OUTPUT_DIR", "var")).expanduser(),
+            apply_changes=apply_enabled,
+            mark_read=mark_read_enabled,
+            use_agent=agent_enabled,
         )

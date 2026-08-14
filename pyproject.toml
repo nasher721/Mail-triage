@@ -5,9 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "email-triage-python"
 version = "0.1.0"
-description = "Review-only Outlook email screening with Microsoft Graph and OpenAI structured outputs"
+description = "Outlook email triage with local Ollama screening and an agent that files mail and drafts replies"
 requires-python = ">=3.11"
 dependencies = []
+
+[project.optional-dependencies]
+owa = ["playwright>=1.40"]
 
 [project.scripts]
 email-triage = "email_triage.cli:main"
