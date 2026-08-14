@@ -1677,6 +1677,7 @@ OWA_HOSTS = (
     "outlook.live.com",
     "outlook.cloud.microsoft",
 )
+OUTLOOK_REST_ROOT = "https://outlook.office.com/api/v2.0"
 EDGE_DEBUG_HELP = (
     "No Microsoft Edge debugging port is open. Outlook on the web can be used "
     "without Graph admin, but Edge must be started with remote debugging so this "
@@ -1710,12 +1711,16 @@ class OwaMailbox:
         auth = self._auth
         if auth is None:
             raise GraphError("Outlook session token was not captured")
+        outlook_rest = auth.api_root == OUTLOOK_REST_ROOT
         query = urlencode(
             {
-                "$filter": "isRead eq false",
+                "$filter": "IsRead eq false" if outlook_rest else "isRead eq false",
                 "$top": str(min(limit, 50)),
                 "$select": (
-                    "id,internetMessageId,subject,from,receivedDateTime,body,"
+                    "Id,InternetMessageId,Subject,From,ReceivedDateTime,Body,"
+                    "HasAttachments,IsRead"
+                    if outlook_rest
+                    else "id,internetMessageId,subject,from,receivedDateTime,body,"
                     "sensitivity,hasAttachments,isRead"
                 ),
             }
@@ -1725,7 +1730,9 @@ class OwaMailbox:
         while url and len(messages) < limit:
             payload = self._json_request("GET", url, absolute=True, token=token)
             for raw in payload.get("value", []):
-                messages.append(_parse_message(raw))
+                messages.append(
+                    _parse_message(_normalize_outlook_message(raw) if outlook_rest else raw)
+                )
                 if len(messages) >= limit:
                     break
             url = payload.get("@odata.nextLink")
@@ -1777,24 +1784,33 @@ class OwaMailbox:
                 parent = cached
                 continue
             escaped = segment.replace("'", "''")
+            outlook_rest = self._auth is not None and self._auth.api_root == OUTLOOK_REST_ROOT
             query = urlencode(
-                {"$filter": f"displayName eq '{escaped}'", "$select": "id,displayName", "$top": "10"}
+                {
+                    "$filter": (
+                        f"DisplayName eq '{escaped}'"
+                        if outlook_rest
+                        else f"displayName eq '{escaped}'"
+                    ),
+                    "$select": "Id,DisplayName" if outlook_rest else "id,displayName",
+                    "$top": "10",
+                }
             )
             found = self._json_request("GET", f"/me/mailFolders/{parent}/childFolders?{query}")
             matches = [
                 item
                 for item in found.get("value", [])
-                if item.get("displayName") == segment and item.get("id")
+                if _value(item, "displayName") == segment and _value(item, "id")
             ]
             if matches:
-                folder_id = str(matches[0]["id"])
+                folder_id = str(_value(matches[0], "id"))
             else:
                 created = self._json_request(
                     "POST",
                     f"/me/mailFolders/{parent}/childFolders",
-                    {"displayName": segment},
+                    {"DisplayName" if outlook_rest else "displayName": segment},
                 )
-                folder_id = str(created.get("id") or "")
+                folder_id = str(_value(created, "id") or "")
                 if not folder_id:
                     raise GraphError(f"Outlook session did not return an id for folder {segment!r}")
             self._folder_ids[walked] = folder_id
@@ -1808,28 +1824,31 @@ class OwaMailbox:
         is_read: bool | None = None,
     ) -> None:
         payload: dict[str, Any] = {}
+        outlook_rest = self._auth is not None and self._auth.api_root == OUTLOOK_REST_ROOT
         if categories is not None:
-            payload["categories"] = list(categories)
+            payload["Categories" if outlook_rest else "categories"] = list(categories)
         if is_read is not None:
-            payload["isRead"] = is_read
+            payload["IsRead" if outlook_rest else "isRead"] = is_read
         if payload:
             self._json_request("PATCH", f"/me/messages/{message_id}", payload)
 
     def create_reply_draft(self, message_id: str, reply_text: str) -> str:
+        outlook_rest = self._auth is not None and self._auth.api_root == OUTLOOK_REST_ROOT
         draft = self._json_request(
             "POST",
             f"/me/messages/{message_id}/createReply",
-            {"comment": _text_to_html(reply_text)},
+            {"Comment" if outlook_rest else "comment": _text_to_html(reply_text)},
         )
-        return str(draft.get("id") or "")
+        return str(_value(draft, "id") or "")
 
     def move_message(self, message_id: str, folder_id: str) -> str:
+        outlook_rest = self._auth is not None and self._auth.api_root == OUTLOOK_REST_ROOT
         moved = self._json_request(
             "POST",
             f"/me/messages/{message_id}/move",
-            {"destinationId": folder_id},
+            {"DestinationId" if outlook_rest else "destinationId": folder_id},
         )
-        return str(moved.get("id") or message_id)
+        return str(_value(moved, "id") or message_id)
 
 
 def edge_debug_available(cdp_url: str) -> bool:
@@ -1853,7 +1872,7 @@ def capture_edge_auth(cdp_url: str) -> CapturedAuth:
             "python3 -m pip install --user playwright"
         ) from exc
 
-    token: str | None = None
+    auth: CapturedAuth | None = None
     playwright = sync_playwright().start()
     browser = None
     try:
@@ -1862,7 +1881,7 @@ def capture_edge_auth(cdp_url: str) -> CapturedAuth:
         except Exception as exc:
             raise ConfigurationError(EDGE_DEBUG_HELP) from exc
         page = _outlook_page(browser)
-        token = _token_from_page(page)
+        auth = _auth_from_page(page)
     except ConfigurationError:
         raise
     except Exception as exc:
@@ -1872,12 +1891,12 @@ def capture_edge_auth(cdp_url: str) -> CapturedAuth:
         if browser is not None:
             browser.close = lambda *args, **kwargs: None
         playwright.stop()
-    if not token:
+    if not auth:
         raise ConfigurationError(
             "Connected to Edge but did not see an Outlook bearer token. Open "
             "https://outlook.office.com/mail/inbox in that Edge window and retry."
         )
-    return CapturedAuth(token=token, api_root=GRAPH_ROOT)
+    return auth
 
 
 def _outlook_page(browser: Any) -> Any:
@@ -1892,26 +1911,73 @@ def _outlook_page(browser: Any) -> Any:
     )
 
 
-def _token_from_page(page: Any) -> str | None:
-    captured: dict[str, str] = {}
+def _auth_from_page(page: Any) -> CapturedAuth | None:
+    captured: dict[str, CapturedAuth] = {}
 
     def on_request(request: Any) -> None:
-        if captured.get("token"):
+        if captured.get("auth"):
             return
         url = request.url or ""
-        if "graph.microsoft.com" not in url and "outlook.office.com" not in url:
+        if "graph.microsoft.com" in url:
+            api_root = GRAPH_ROOT
+        elif any(host in url for host in OWA_HOSTS):
+            api_root = OUTLOOK_REST_ROOT
+        else:
             return
         headers = {key.lower(): value for key, value in request.headers.items()}
-        auth = headers.get("authorization", "")
-        if auth.lower().startswith("bearer ") and len(auth) > 20:
-            captured["token"] = auth.split(" ", 1)[1].strip()
+        authorization = headers.get("authorization", "")
+        if authorization.lower().startswith("bearer ") and len(authorization) > 20:
+            captured["auth"] = CapturedAuth(
+                token=authorization.split(" ", 1)[1].strip(),
+                api_root=api_root,
+            )
 
     page.on("request", on_request)
-    deadline = time.time() + 20
     _nudge_inbox(page)
-    while time.time() < deadline and not captured.get("token"):
+    deadline = time.time() + 3
+    while time.time() < deadline and not captured.get("auth"):
         page.wait_for_timeout(250)
-    return captured.get("token")
+    if not captured.get("auth"):
+        try:
+            page.reload(wait_until="domcontentloaded", timeout=15000)
+        except Exception:
+            pass
+        deadline = time.time() + 20
+        while time.time() < deadline and not captured.get("auth"):
+            page.wait_for_timeout(250)
+    return captured.get("auth")
+
+
+def _value(payload: dict[str, Any], camel_name: str) -> Any:
+    """Read either Graph camelCase or Outlook REST PascalCase properties."""
+
+    if camel_name in payload:
+        return payload[camel_name]
+    pascal_name = camel_name[:1].upper() + camel_name[1:]
+    return payload.get(pascal_name)
+
+
+def _normalize_outlook_message(raw: dict[str, Any]) -> dict[str, Any]:
+    sender = _value(raw, "from") or {}
+    email_address = _value(sender, "emailAddress") or {}
+    body = _value(raw, "body") or {}
+    return {
+        "id": _value(raw, "id"),
+        "internetMessageId": _value(raw, "internetMessageId"),
+        "subject": _value(raw, "subject"),
+        "from": {
+            "emailAddress": {
+                "name": _value(email_address, "name"),
+                "address": _value(email_address, "address"),
+            }
+        },
+        "receivedDateTime": _value(raw, "receivedDateTime"),
+        "body": {"content": _value(body, "content")},
+        "sensitivity": _value(raw, "sensitivity"),
+        "hasAttachments": _value(raw, "hasAttachments"),
+        "isRead": _value(raw, "isRead"),
+        "@odata.type": raw.get("@odata.type"),
+    }
 
 
 def _nudge_inbox(page: Any) -> None:
@@ -2917,6 +2983,58 @@ class OwaConfigTests(unittest.TestCase):
 
 
 class OwaMailboxTests(unittest.TestCase):
+    def test_token_capture_routes_outlook_token_to_matching_api(self) -> None:
+        class FakeRequest:
+            def __init__(self, url: str, token: str):
+                self.url = url
+                self.headers = {"Authorization": f"Bearer {token}"}
+
+        class FakeLocator:
+            def __init__(self, page: "FakePage"):
+                self.page = page
+
+            @property
+            def first(self) -> "FakeLocator":
+                return self
+
+            def count(self) -> int:
+                return 1
+
+            def click(self, timeout: int) -> None:
+                del timeout
+                for request in self.page.requests:
+                    self.page.handler(request)
+
+        class FakePage:
+            def __init__(self):
+                self.requests = [
+                    FakeRequest(
+                        "https://outlook.office.com/owa/service.svc",
+                        "outlook-token-with-realistic-length",
+                    ),
+                    FakeRequest(
+                        "https://graph.microsoft.com/v1.0/me/messages",
+                        "graph-token-with-realistic-length",
+                    ),
+                ]
+                self.handler = lambda request: None
+
+            def on(self, event: str, handler) -> None:
+                self.assert_event = event
+                self.handler = handler
+
+            def locator(self, selector: str) -> FakeLocator:
+                del selector
+                return FakeLocator(self)
+
+            def wait_for_timeout(self, timeout: int) -> None:
+                del timeout
+
+        auth = _auth_from_page(FakePage())
+        self.assertIsNotNone(auth)
+        self.assertEqual(auth.token, "outlook-token-with-realistic-length")
+        self.assertEqual(auth.api_root, OUTLOOK_REST_ROOT)
+
     def test_missing_debug_port_explains_edge_relaunch(self) -> None:
         with patch(__name__ + ".urlopen", side_effect=URLError("down")):
             self.assertFalse(edge_debug_available("http://127.0.0.1:9222"))
@@ -2945,6 +3063,43 @@ class OwaMailboxTests(unittest.TestCase):
         self.assertEqual(len(messages), 1)
         self.assertEqual(messages[0].id, "example-id")
         self.assertIn("mailFolders/inbox/messages", request.call_args.args[1])
+
+    def test_outlook_rest_messages_are_normalized(self) -> None:
+        mailbox = OwaMailbox("http://127.0.0.1:9222", read_write=False)
+        mailbox._auth = CapturedAuth("synthetic-token", OUTLOOK_REST_ROOT)
+        payload = {
+            "value": [
+                {
+                    "Id": "example-id",
+                    "InternetMessageId": "example-internet-id",
+                    "Subject": "Synthetic subject",
+                    "From": {
+                        "EmailAddress": {"Name": "Alex", "Address": "alex@example.org"}
+                    },
+                    "ReceivedDateTime": "2026-08-13T12:00:00Z",
+                    "Body": {"ContentType": "Text", "Content": "Synthetic body"},
+                    "Sensitivity": "Normal",
+                    "HasAttachments": False,
+                    "IsRead": False,
+                }
+            ]
+        }
+        with patch.object(mailbox, "_json_request", return_value=payload) as request:
+            messages = mailbox.unread_messages(5)
+        self.assertEqual(messages[0].sender_address, "alex@example.org")
+        self.assertEqual(messages[0].body, "Synthetic body")
+        self.assertIn("IsRead+eq+false", request.call_args.args[1])
+        self.assertNotIn("Sensitivity", request.call_args.args[1])
+
+    def test_outlook_rest_writes_use_pascal_case(self) -> None:
+        mailbox = OwaMailbox("http://127.0.0.1:9222", read_write=True)
+        mailbox._auth = CapturedAuth("synthetic-token", OUTLOOK_REST_ROOT)
+        with patch.object(mailbox, "_json_request", return_value={}) as request:
+            mailbox.update_message("example-id", categories=("Needs Reply",), is_read=True)
+        self.assertEqual(
+            request.call_args.args[2],
+            {"Categories": ["Needs Reply"], "IsRead": True},
+        )
 
     def test_writes_require_apply(self) -> None:
         mailbox = OwaMailbox("http://127.0.0.1:9222", read_write=False)
