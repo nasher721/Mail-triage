@@ -1,4 +1,6 @@
 import importlib.util
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 
@@ -24,6 +26,16 @@ class SingleFileBundleTests(unittest.TestCase):
             builder.render(),
             "email_triage_standalone.py is stale; run python tools/build_single_file.py",
         )
+
+    def test_bundle_self_test_passes(self) -> None:
+        result = subprocess.run(
+            [sys.executable, str(BUNDLE), "--self-test"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_no_send_or_delete_path_exists(self) -> None:
         from email_triage.graph import READ_SCOPES, READ_WRITE_SCOPES
