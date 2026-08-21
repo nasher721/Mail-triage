@@ -2,6 +2,13 @@ import AppKit
 import Foundation
 import SwiftUI
 
+/// Which role a provider check is for, when screening and the sorting agent
+/// might otherwise share the same `AIProvider` case with different endpoints.
+enum ProviderRole {
+    case screening
+    case agent
+}
+
 /// Readiness of one AI provider, as far as the app can tell without spending money.
 enum ProviderStatus: Equatable {
     case unknown
@@ -267,7 +274,7 @@ final class AppStore: ObservableObject {
         screeningBaseURL = provider.defaultBaseURL
         if !useSeparateAgentProvider { agentProvider = provider }
         persistSettings()
-        checkProvider(provider)
+        checkProvider(provider, role: .screening)
     }
 
     func selectAgentProvider(_ provider: AIProvider) {
@@ -275,7 +282,7 @@ final class AppStore: ObservableObject {
         agentModel = provider.defaultModel
         agentBaseURL = provider.defaultBaseURL
         persistSettings()
-        checkProvider(provider)
+        checkProvider(provider, role: .agent)
     }
 
     func status(for provider: AIProvider) -> ProviderStatus {
@@ -289,9 +296,15 @@ final class AppStore: ObservableObject {
 
     /// Check one provider. Local endpoints are probed; hosted ones are only
     /// checked for a usable key, so no billable request is ever made here.
-    func checkProvider(_ provider: AIProvider) {
+    ///
+    /// `role` disambiguates which base URL to probe when screening and the
+    /// sorting agent share the same `AIProvider` case but point at different
+    /// endpoints (e.g. two local Ollama instances on different ports). Pass
+    /// it whenever the caller knows which role it is checking; omit it only
+    /// for provider-identity-only checks (a card's generic "Check" button).
+    func checkProvider(_ provider: AIProvider, role: ProviderRole? = nil) {
         providerCheckTasks[provider]?.cancel()
-        let endpoint = resolvedBaseURL(for: provider)
+        let endpoint = resolvedBaseURL(for: provider, role: role)
 
         if let failure = provider.validate(baseURL: endpoint) {
             providerStatuses[provider] = .needsAttention(failure)
@@ -332,7 +345,7 @@ final class AppStore: ObservableObject {
                     throw URLError(.badServerResponse)
                 }
                 let names = Self.modelNames(from: data, provider: provider)
-                guard endpoint == self.resolvedBaseURL(for: provider) else { return }
+                guard endpoint == self.resolvedBaseURL(for: provider, role: role) else { return }
                 self.installedModels[provider] = names
                 self.providerStatuses[provider] = names.isEmpty
                     ? .needsAttention("\(provider.title) is running but has no models installed.")
@@ -340,7 +353,7 @@ final class AppStore: ObservableObject {
             } catch is CancellationError {
                 return
             } catch {
-                guard endpoint == self.resolvedBaseURL(for: provider) else { return }
+                guard endpoint == self.resolvedBaseURL(for: provider, role: role) else { return }
                 self.providerStatuses[provider] = .needsAttention(
                     "\(provider.title) is not reachable at \(endpoint)."
                 )
@@ -349,17 +362,30 @@ final class AppStore: ObservableObject {
     }
 
     func checkSelectedProviders() {
-        checkProvider(screeningProvider)
-        if useSeparateAgentProvider { checkProvider(agentProvider) }
+        checkProvider(screeningProvider, role: .screening)
+        if useSeparateAgentProvider { checkProvider(agentProvider, role: .agent) }
     }
 
     /// The endpoint currently configured for a provider, without a trailing slash.
-    private func resolvedBaseURL(for provider: AIProvider) -> String {
+    ///
+    /// When `role` is given, it resolves that role's own base URL directly, so
+    /// screening and the sorting agent never get conflated when they share the
+    /// same `AIProvider` case. Without a role, it falls back to guessing from
+    /// provider identity (screening takes priority), which is only correct
+    /// when the two roles use different providers.
+    private func resolvedBaseURL(for provider: AIProvider, role: ProviderRole? = nil) -> String {
         var value = provider.defaultBaseURL
-        if provider == screeningProvider, !screeningBaseURL.isEmpty {
-            value = screeningBaseURL
-        } else if useSeparateAgentProvider, provider == agentProvider, !agentBaseURL.isEmpty {
-            value = agentBaseURL
+        switch role {
+        case .screening:
+            if !screeningBaseURL.isEmpty { value = screeningBaseURL }
+        case .agent:
+            if !agentBaseURL.isEmpty { value = agentBaseURL }
+        case nil:
+            if provider == screeningProvider, !screeningBaseURL.isEmpty {
+                value = screeningBaseURL
+            } else if useSeparateAgentProvider, provider == agentProvider, !agentBaseURL.isEmpty {
+                value = agentBaseURL
+            }
         }
         var trimmed = value.trimmingCharacters(in: .whitespaces)
         while trimmed.hasSuffix("/") { trimmed.removeLast() }
