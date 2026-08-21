@@ -35,6 +35,8 @@ struct ContentView: View {
         switch store.selection {
         case .overview:
             OverviewView()
+        case .providers:
+            ProvidersView()
         case .results:
             ResultsView()
         case .activity:
@@ -69,7 +71,7 @@ struct ContentView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(!store.canRun)
-                .help("Run Mail Triage (Command-R)")
+                .help(store.runBlockedReason ?? "Run Mail Triage (Command-R)")
             }
         }
     }

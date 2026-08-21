@@ -255,14 +255,12 @@ class LiveProbeBoundaryTests(unittest.TestCase):
         output = io.StringIO()
         with patch("email_triage.cli.run_live_probe", return_value=result), patch(
             "email_triage.cli.build_classifier"
-        ) as classifier, patch(
-            "email_triage.cli._list_ollama_models"
-        ) as models, redirect_stdout(output):
+        ) as classifier, patch("email_triage.cli.build_agent") as agent, redirect_stdout(output):
             status = main(["--source", "graph", "--live-probe"])
         self.assertEqual(status, 0)
         self.assertEqual(json.loads(output.getvalue()), result.to_dict())
         classifier.assert_not_called()
-        models.assert_not_called()
+        agent.assert_not_called()
 
     def test_cli_rejects_implicit_local_and_operational_flags(self) -> None:
         cases = [

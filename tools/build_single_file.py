@@ -28,6 +28,7 @@ BUNDLE = ROOT / "email_triage_standalone.py"
 #: Dependency order. Every module only references names defined above it.
 MODULE_ORDER = (
     "models",
+    "providers",
     "config",
     "backends",
     "desktop",
@@ -48,6 +49,7 @@ MODULE_ORDER = (
 
 TEST_ORDER = (
     "test_models",
+    "test_providers",
     "test_config",
     "test_backends",
     "test_desktop",

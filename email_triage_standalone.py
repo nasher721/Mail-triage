@@ -25,7 +25,6 @@ import fcntl
 import hashlib
 import importlib
 import io
-import ipaddress
 import json
 import os
 import platform
@@ -41,6 +40,7 @@ from contextlib import contextmanager
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import asdict, dataclass
 from dataclasses import dataclass
+from dataclasses import dataclass, field
 from dataclasses import dataclass, field, replace
 from dataclasses import replace
 from datetime import datetime
@@ -56,6 +56,7 @@ from stat import S_IMODE
 from types import ModuleType
 from typing import Any
 from typing import Any, Callable
+from typing import Any, Iterable, Mapping, Sequence
 from typing import Any, Protocol
 from typing import Callable
 from typing import Iterator
@@ -278,8 +279,922 @@ def _json_safe(value: Any) -> Any:
 
 
 # -------------------------------------------------------------------------
+# email_triage/providers.py
+# -------------------------------------------------------------------------
+
+"""Provider registry and message routing for every supported AI system.
+
+One triage run talks to exactly one screening provider and one sorting-agent
+provider. Both are described by a :class:`ProviderProfile` and reached through a
+:class:`ProviderClient`, so the rest of the package never encodes a vendor wire
+format. Four wire dialects cover the ecosystem:
+
+``ollama``            local Ollama ``/api/chat`` with JSON-schema output
+``openai_chat``       OpenAI-compatible ``/chat/completions`` (OpenRouter, Groq,
+                      LM Studio, OpenCode, Gemini's compatibility endpoint, ...)
+``openai_responses``  OpenAI's own ``/responses`` endpoint
+``anthropic``         Claude's ``/v1/messages`` with tool-shaped structured output
+
+Neutral message and tool records are translated to the selected dialect on every
+request, which keeps the policy gate in :mod:`email_triage.actions` the single
+authority over what a model is allowed to do, whichever vendor answers.
+"""
+
+
+
+OLLAMA = "ollama"
+OPENAI_CHAT = "openai_chat"
+OPENAI_RESPONSES = "openai_responses"
+ANTHROPIC = "anthropic"
+
+
+class ProviderError(RuntimeError):
+    """Raised when a provider cannot be reached or answers unusably."""
+
+
+@dataclass(frozen=True)
+class ProviderProfile:
+    """Everything the router needs to talk to one AI system."""
+
+    name: str
+    label: str
+    api_style: str
+    default_base_url: str
+    default_model: str
+    #: Environment variables searched, in order, for this provider's key.
+    api_key_env: tuple[str, ...] = ()
+    requires_api_key: bool = True
+    #: True when inference runs on the operator's own machine or network.
+    local: bool = False
+    supports_tools: bool = True
+    supports_json_schema: bool = True
+    auth_header: str = "Authorization"
+    auth_prefix: str = "Bearer "
+    extra_headers: tuple[tuple[str, str], ...] = ()
+    notes: str = ""
+
+    @property
+    def is_openai_compatible(self) -> bool:
+        return self.api_style in {OPENAI_CHAT, OPENAI_RESPONSES}
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "label": self.label,
+            "api_style": self.api_style,
+            "default_base_url": self.default_base_url,
+            "default_model": self.default_model,
+            "api_key_env": list(self.api_key_env),
+            "requires_api_key": self.requires_api_key,
+            "local": self.local,
+            "supports_tools": self.supports_tools,
+            "supports_json_schema": self.supports_json_schema,
+            "notes": self.notes,
+        }
+
+
+PROVIDERS: dict[str, ProviderProfile] = {
+    profile.name: profile
+    for profile in (
+        ProviderProfile(
+            name="ollama",
+            label="Ollama (local)",
+            api_style=OLLAMA,
+            default_base_url="http://127.0.0.1:11434",
+            default_model="qwen3:8b",
+            api_key_env=(),
+            requires_api_key=False,
+            local=True,
+            notes="Runs entirely on this machine. No approval required on loopback.",
+        ),
+        ProviderProfile(
+            name="lmstudio",
+            label="LM Studio (local)",
+            api_style=OPENAI_CHAT,
+            default_base_url="http://127.0.0.1:1234/v1",
+            default_model="local-model",
+            api_key_env=("LMSTUDIO_API_KEY",),
+            requires_api_key=False,
+            local=True,
+            notes="LM Studio's OpenAI-compatible local server.",
+        ),
+        ProviderProfile(
+            name="llamacpp",
+            label="llama.cpp server (local)",
+            api_style=OPENAI_CHAT,
+            default_base_url="http://127.0.0.1:8080/v1",
+            default_model="local-model",
+            requires_api_key=False,
+            local=True,
+            supports_json_schema=False,
+            notes="llama-server --api-key-free OpenAI-compatible endpoint.",
+        ),
+        ProviderProfile(
+            name="opencode",
+            label="OpenCode (local server)",
+            api_style=OPENAI_CHAT,
+            default_base_url="http://127.0.0.1:4096/v1",
+            default_model="opencode/default",
+            api_key_env=("OPENCODE_API_KEY",),
+            requires_api_key=False,
+            local=True,
+            supports_json_schema=False,
+            notes="Start with `opencode serve`; point the base URL at its OpenAI-compatible route.",
+        ),
+        ProviderProfile(
+            name="openai",
+            label="OpenAI (ChatGPT models)",
+            api_style=OPENAI_RESPONSES,
+            default_base_url="https://api.openai.com/v1",
+            default_model="gpt-4o",
+            api_key_env=("OPENAI_API_KEY",),
+            notes="Uses the Responses API for screening and chat completions for the agent.",
+        ),
+        ProviderProfile(
+            name="anthropic",
+            label="Anthropic (Claude)",
+            api_style=ANTHROPIC,
+            default_base_url="https://api.anthropic.com",
+            default_model="claude-sonnet-4-5",
+            api_key_env=("ANTHROPIC_API_KEY", "CLAUDE_API_KEY"),
+            auth_header="x-api-key",
+            auth_prefix="",
+            extra_headers=(("anthropic-version", "2023-06-01"),),
+            notes="Structured screening is requested through a single forced tool call.",
+        ),
+        ProviderProfile(
+            name="openrouter",
+            label="OpenRouter (multi-vendor)",
+            api_style=OPENAI_CHAT,
+            default_base_url="https://openrouter.ai/api/v1",
+            default_model="anthropic/claude-sonnet-4.5",
+            api_key_env=("OPENROUTER_API_KEY",),
+            extra_headers=(("X-Title", "Mail Triage"),),
+            notes="One key, many upstream models. Model ids are vendor-prefixed.",
+        ),
+        ProviderProfile(
+            name="azure-openai",
+            label="Azure OpenAI",
+            api_style=OPENAI_CHAT,
+            default_base_url="",
+            default_model="gpt-4o",
+            api_key_env=("AZURE_OPENAI_API_KEY",),
+            auth_header="api-key",
+            auth_prefix="",
+            notes=(
+                "Set the base URL to "
+                "https://<resource>.openai.azure.com/openai/deployments/<deployment>"
+                "?api-version=2024-10-21 style routes."
+            ),
+        ),
+        ProviderProfile(
+            name="gemini",
+            label="Google Gemini",
+            api_style=OPENAI_CHAT,
+            default_base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+            default_model="gemini-2.5-flash",
+            api_key_env=("GEMINI_API_KEY", "GOOGLE_API_KEY"),
+            notes="Google's OpenAI-compatible compatibility layer.",
+        ),
+        ProviderProfile(
+            name="groq",
+            label="Groq",
+            api_style=OPENAI_CHAT,
+            default_base_url="https://api.groq.com/openai/v1",
+            default_model="llama-3.3-70b-versatile",
+            api_key_env=("GROQ_API_KEY",),
+        ),
+        ProviderProfile(
+            name="mistral",
+            label="Mistral",
+            api_style=OPENAI_CHAT,
+            default_base_url="https://api.mistral.ai/v1",
+            default_model="mistral-large-latest",
+            api_key_env=("MISTRAL_API_KEY",),
+            supports_json_schema=False,
+        ),
+        ProviderProfile(
+            name="deepseek",
+            label="DeepSeek",
+            api_style=OPENAI_CHAT,
+            default_base_url="https://api.deepseek.com/v1",
+            default_model="deepseek-chat",
+            api_key_env=("DEEPSEEK_API_KEY",),
+            supports_json_schema=False,
+        ),
+        ProviderProfile(
+            name="together",
+            label="Together AI",
+            api_style=OPENAI_CHAT,
+            default_base_url="https://api.together.xyz/v1",
+            default_model="meta-llama/Llama-3.3-70B-Instruct-Turbo",
+            api_key_env=("TOGETHER_API_KEY",),
+        ),
+        ProviderProfile(
+            name="xai",
+            label="xAI (Grok)",
+            api_style=OPENAI_CHAT,
+            default_base_url="https://api.x.ai/v1",
+            default_model="grok-4",
+            api_key_env=("XAI_API_KEY",),
+        ),
+        ProviderProfile(
+            name="custom",
+            label="Custom OpenAI-compatible endpoint",
+            api_style=OPENAI_CHAT,
+            default_base_url="",
+            default_model="",
+            api_key_env=("TRIAGE_API_KEY",),
+            requires_api_key=False,
+            supports_json_schema=False,
+            notes="Any gateway that speaks /chat/completions. Set the base URL and model.",
+        ),
+    )
+}
+
+#: Friendly names people type, including the pre-registry TRIAGE_BACKEND values.
+PROVIDER_ALIASES = {
+    "chatgpt": "openai",
+    "claude": "anthropic",
+    "google": "gemini",
+    "azure": "azure-openai",
+    "openai-compatible": "custom",
+    "local": "ollama",
+}
+
+PROVIDER_NAMES = tuple(PROVIDERS)
+
+
+def resolve_provider_name(value: str) -> str:
+    """Map a user-supplied provider name (or alias) onto a registry key."""
+
+    key = value.strip().lower().replace("_", "-")
+    key = PROVIDER_ALIASES.get(key, key)
+    if key not in PROVIDERS:
+        raise KeyError(value)
+    return key
+
+
+def provider_profile(name: str) -> ProviderProfile:
+    return PROVIDERS[resolve_provider_name(name)]
+
+
+def api_key_from_environment(
+    profile: ProviderProfile, environment: Mapping[str, str] | None = None
+) -> str:
+    env = os.environ if environment is None else environment
+    for variable in profile.api_key_env:
+        value = env.get(variable, "").strip()
+        if value:
+            return value
+    return ""
+
+
+@dataclass(frozen=True)
+class ProviderSelection:
+    """A fully resolved provider binding for one role (screening or sorting)."""
+
+    profile: ProviderProfile
+    base_url: str
+    model: str
+    api_key: str = ""
+    temperature: float | None = None
+    timeout: int = 180
+
+    @property
+    def name(self) -> str:
+        return self.profile.name
+
+    @property
+    def is_loopback(self) -> bool:
+        return is_loopback_url(self.base_url)
+
+    @property
+    def keeps_data_local(self) -> bool:
+        """True when message text never leaves this machine."""
+
+        return self.profile.local and self.is_loopback
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "provider": self.profile.name,
+            "label": self.profile.label,
+            "api_style": self.profile.api_style,
+            "base_url": self.base_url,
+            "model": self.model,
+            "api_key_present": bool(self.api_key),
+            "keeps_data_local": self.keeps_data_local,
+        }
+
+
+def is_loopback_url(url: str) -> bool:
+    """True when a base URL points at this machine."""
+
+    if not url:
+        return False
+    parsed = urlparse(url if "://" in url else f"http://{url}")
+    host = (parsed.hostname or "").lower()
+    return host in {"localhost", "127.0.0.1", "::1"} or host.startswith("127.")
+
+
+# ---------------------------------------------------------------------------
+# Neutral conversation records
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ToolCall:
+    id: str
+    name: str
+    arguments: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class AssistantReply:
+    content: str = ""
+    tool_calls: tuple[ToolCall, ...] = ()
+
+
+@dataclass(frozen=True)
+class ToolSpec:
+    name: str
+    description: str
+    parameters: dict[str, Any] = field(default_factory=dict)
+
+
+def system_message(content: str) -> dict[str, Any]:
+    return {"role": "system", "content": content}
+
+
+def user_message(content: str) -> dict[str, Any]:
+    return {"role": "user", "content": content}
+
+
+def assistant_message(reply: AssistantReply) -> dict[str, Any]:
+    return {"role": "assistant", "content": reply.content, "tool_calls": list(reply.tool_calls)}
+
+
+def tool_message(call: ToolCall, content: str) -> dict[str, Any]:
+    return {
+        "role": "tool",
+        "tool_call_id": call.id,
+        "name": call.name,
+        "content": content,
+    }
+
+
+def _coerce_arguments(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def parse_json_object(text: Any) -> dict[str, Any]:
+    """Read a JSON object out of model output, tolerating surrounding prose."""
+
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("empty model output")
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        stripped = stripped.strip("`")
+        _, _, stripped = stripped.partition("\n")
+        stripped = stripped.strip()
+    try:
+        value = json.loads(stripped)
+    except json.JSONDecodeError:
+        start = stripped.find("{")
+        end = stripped.rfind("}")
+        if start == -1 or end <= start:
+            raise
+        value = json.loads(stripped[start : end + 1])
+    if not isinstance(value, dict):
+        raise ValueError("model output is not a JSON object")
+    return value
+
+
+# ---------------------------------------------------------------------------
+# Clients
+# ---------------------------------------------------------------------------
+
+
+class ProviderClient:
+    """Route neutral requests to one provider and normalise the answer."""
+
+    def __init__(self, selection: ProviderSelection):
+        self.selection = selection
+        self.profile = selection.profile
+        self.base_url = selection.base_url.rstrip("/")
+        self.model = selection.model
+        self.timeout = selection.timeout
+
+    # -- transport ---------------------------------------------------------
+    def _headers(self) -> dict[str, str]:
+        headers = {"Content-Type": "application/json"}
+        headers.update(dict(self.profile.extra_headers))
+        if self.selection.api_key:
+            headers[self.profile.auth_header] = (
+                f"{self.profile.auth_prefix}{self.selection.api_key}"
+            )
+        return headers
+
+    def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        url = self._url(path)
+        request = Request(
+            url,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers=self._headers(),
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=self.timeout) as response:
+                return json.load(response)
+        except HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:400]
+            raise ProviderError(
+                f"{self.profile.label} request failed ({exc.code}): {detail}"
+            ) from exc
+        except (URLError, TimeoutError, json.JSONDecodeError) as exc:
+            raise ProviderError(f"{self.profile.label} is unreachable at {url}") from exc
+
+    def _url(self, path: str) -> str:
+        base = self.base_url
+        if "?" in base:  # Azure-style routes carry an api-version query string.
+            head, _, query = base.partition("?")
+            return f"{head.rstrip('/')}{path}?{query}"
+        return f"{base}{path}"
+
+    # -- capabilities ------------------------------------------------------
+    def available_models(self) -> list[str]:
+        """Best-effort model listing; an empty list means "could not ask"."""
+
+        return []
+
+    def reachable(self) -> tuple[bool, str]:
+        """Cheap readiness check that never sends message content."""
+
+        if self.profile.requires_api_key and not self.selection.api_key:
+            variables = " or ".join(self.profile.api_key_env) or "an API key"
+            return False, f"{self.profile.label} needs {variables}."
+        if not self.base_url:
+            return False, f"{self.profile.label} needs a base URL."
+        return True, f"{self.profile.label} is configured for {self.model}."
+
+    # -- inference ---------------------------------------------------------
+    def complete_json(
+        self, instructions: str, payload: str, schema: dict[str, Any], schema_name: str
+    ) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def chat(
+        self, messages: Sequence[Mapping[str, Any]], tools: Sequence[ToolSpec]
+    ) -> AssistantReply:
+        raise NotImplementedError
+
+
+class OllamaClient(ProviderClient):
+    def available_models(self) -> list[str]:
+        request = Request(f"{self.base_url}/api/tags", method="GET")
+        try:
+            with urlopen(request, timeout=5) as response:
+                body = json.load(response)
+        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
+            return []
+        return [
+            item["name"]
+            for item in body.get("models", [])
+            if isinstance(item.get("name"), str) and item["name"]
+        ]
+
+    def reachable(self) -> tuple[bool, str]:
+        models = self.available_models()
+        if not models:
+            return False, (
+                f"Ollama is unavailable at {self.base_url} or has no models. "
+                f"Start it with `ollama serve` and run `ollama pull {self.model}`."
+            )
+        return True, f"Ollama is ready with {len(models)} installed model(s)."
+
+    def complete_json(
+        self, instructions: str, payload: str, schema: dict[str, Any], schema_name: str
+    ) -> dict[str, Any]:
+        body = {
+            "model": self.model,
+            "stream": False,
+            "think": False,
+            "format": schema,
+            "messages": [
+                {"role": "system", "content": instructions},
+                {"role": "user", "content": payload},
+            ],
+        }
+        if self.selection.temperature is not None:
+            body["options"] = {"temperature": self.selection.temperature}
+        try:
+            raw = self._post("/api/chat", body)
+        except ProviderError as exc:
+            if "(404)" in str(exc):
+                raise ProviderError(
+                    f"Ollama model {self.model!r} is not installed. "
+                    f"Run: ollama pull {self.model}"
+                ) from exc
+            raise
+        return parse_json_object(raw.get("message", {}).get("content"))
+
+    def chat(
+        self, messages: Sequence[Mapping[str, Any]], tools: Sequence[ToolSpec]
+    ) -> AssistantReply:
+        body: dict[str, Any] = {
+            "model": self.model,
+            "stream": False,
+            "think": False,
+            "messages": [_ollama_message(message) for message in messages],
+        }
+        if tools:
+            body["tools"] = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.parameters,
+                    },
+                }
+                for tool in tools
+            ]
+        if self.selection.temperature is not None:
+            body["options"] = {"temperature": self.selection.temperature}
+        raw = self._post("/api/chat", body)
+        message = raw.get("message")
+        if not isinstance(message, dict):
+            raise ProviderError("Ollama returned no message")
+        calls: list[ToolCall] = []
+        for index, call in enumerate(message.get("tool_calls") or []):
+            function = call.get("function", {}) if isinstance(call, dict) else {}
+            calls.append(
+                ToolCall(
+                    id=str(call.get("id") or f"call_{index}"),
+                    name=str(function.get("name", "")),
+                    arguments=_coerce_arguments(function.get("arguments")),
+                )
+            )
+        return AssistantReply(str(message.get("content") or ""), tuple(calls))
+
+
+def _ollama_message(message: Mapping[str, Any]) -> dict[str, Any]:
+    role = message.get("role")
+    if role == "tool":
+        return {
+            "role": "tool",
+            "tool_name": message.get("name", ""),
+            "content": message.get("content", ""),
+        }
+    rendered: dict[str, Any] = {"role": role, "content": message.get("content", "")}
+    calls = message.get("tool_calls") or []
+    if calls:
+        rendered["tool_calls"] = [
+            {"function": {"name": call.name, "arguments": call.arguments}} for call in calls
+        ]
+    return rendered
+
+
+class OpenAIChatClient(ProviderClient):
+    """OpenAI-compatible ``/chat/completions``, used by most hosted vendors."""
+
+    def available_models(self) -> list[str]:
+        request = Request(self._url("/models"), headers=self._headers(), method="GET")
+        try:
+            with urlopen(request, timeout=8) as response:
+                body = json.load(response)
+        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
+            return []
+        return [
+            item["id"]
+            for item in body.get("data", [])
+            if isinstance(item, dict) and isinstance(item.get("id"), str)
+        ]
+
+    def complete_json(
+        self, instructions: str, payload: str, schema: dict[str, Any], schema_name: str
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": instructions},
+                {"role": "user", "content": payload},
+            ],
+        }
+        if self.profile.supports_json_schema:
+            body["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {"name": schema_name, "strict": True, "schema": schema},
+            }
+        else:
+            body["response_format"] = {"type": "json_object"}
+            body["messages"][0]["content"] = (
+                f"{instructions}\n\nReturn a single JSON object matching this schema "
+                f"exactly:\n{json.dumps(schema, ensure_ascii=False)}"
+            )
+        if self.selection.temperature is not None:
+            body["temperature"] = self.selection.temperature
+        raw = self._post("/chat/completions", body)
+        return parse_json_object(_openai_choice(raw).get("content"))
+
+    def chat(
+        self, messages: Sequence[Mapping[str, Any]], tools: Sequence[ToolSpec]
+    ) -> AssistantReply:
+        body: dict[str, Any] = {
+            "model": self.model,
+            "messages": [_openai_message(message) for message in messages],
+        }
+        if tools:
+            body["tools"] = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.parameters,
+                    },
+                }
+                for tool in tools
+            ]
+        if self.selection.temperature is not None:
+            body["temperature"] = self.selection.temperature
+        raw = self._post("/chat/completions", body)
+        message = _openai_choice(raw)
+        calls: list[ToolCall] = []
+        for index, call in enumerate(message.get("tool_calls") or []):
+            function = call.get("function", {}) if isinstance(call, dict) else {}
+            calls.append(
+                ToolCall(
+                    id=str(call.get("id") or f"call_{index}"),
+                    name=str(function.get("name", "")),
+                    arguments=_coerce_arguments(function.get("arguments")),
+                )
+            )
+        return AssistantReply(str(message.get("content") or ""), tuple(calls))
+
+
+def _openai_choice(raw: Mapping[str, Any]) -> dict[str, Any]:
+    choices = raw.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise ProviderError("provider returned no choices")
+    message = choices[0].get("message")
+    if not isinstance(message, dict):
+        raise ProviderError("provider returned no message")
+    return message
+
+
+def _openai_message(message: Mapping[str, Any]) -> dict[str, Any]:
+    role = message.get("role")
+    if role == "tool":
+        return {
+            "role": "tool",
+            "tool_call_id": message.get("tool_call_id", ""),
+            "content": message.get("content", ""),
+        }
+    rendered: dict[str, Any] = {"role": role, "content": message.get("content", "")}
+    calls = message.get("tool_calls") or []
+    if calls:
+        rendered["tool_calls"] = [
+            {
+                "id": call.id,
+                "type": "function",
+                "function": {
+                    "name": call.name,
+                    "arguments": json.dumps(call.arguments, ensure_ascii=False),
+                },
+            }
+            for call in calls
+        ]
+    return rendered
+
+
+class OpenAIResponsesClient(OpenAIChatClient):
+    """OpenAI's own endpoint: Responses for screening, chat completions for tools."""
+
+    def complete_json(
+        self, instructions: str, payload: str, schema: dict[str, Any], schema_name: str
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "model": self.model,
+            "store": False,
+            "instructions": instructions,
+            "input": payload,
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": schema_name,
+                    "strict": True,
+                    "schema": schema,
+                }
+            },
+        }
+        if self.selection.temperature is not None:
+            body["temperature"] = self.selection.temperature
+        raw = self._post("/responses", body)
+        return parse_json_object(_responses_output_text(raw))
+
+
+def _responses_output_text(raw: Mapping[str, Any]) -> str:
+    for item in raw.get("output", []):
+        if item.get("type") != "message":
+            continue
+        for content in item.get("content", []):
+            if content.get("type") == "output_text" and isinstance(content.get("text"), str):
+                return content["text"]
+            if content.get("type") == "refusal":
+                raise ProviderError("model refused the screening request")
+    raise ProviderError("response did not contain output_text")
+
+
+class AnthropicClient(ProviderClient):
+    """Claude's Messages API. Structured output uses one forced tool call."""
+
+    max_tokens = 2048
+
+    def available_models(self) -> list[str]:
+        request = Request(f"{self.base_url}/v1/models", headers=self._headers(), method="GET")
+        try:
+            with urlopen(request, timeout=8) as response:
+                body = json.load(response)
+        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
+            return []
+        return [
+            item["id"]
+            for item in body.get("data", [])
+            if isinstance(item, dict) and isinstance(item.get("id"), str)
+        ]
+
+    def complete_json(
+        self, instructions: str, payload: str, schema: dict[str, Any], schema_name: str
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "model": self.model,
+            "max_tokens": self.max_tokens,
+            "system": instructions,
+            "messages": [{"role": "user", "content": [{"type": "text", "text": payload}]}],
+            "tools": [
+                {
+                    "name": schema_name,
+                    "description": "Return the screening result for this email.",
+                    "input_schema": schema,
+                }
+            ],
+            "tool_choice": {"type": "tool", "name": schema_name},
+        }
+        if self.selection.temperature is not None:
+            body["temperature"] = self.selection.temperature
+        raw = self._post("/v1/messages", body)
+        for block in raw.get("content", []):
+            if block.get("type") == "tool_use" and isinstance(block.get("input"), dict):
+                return block["input"]
+            if block.get("type") == "text" and isinstance(block.get("text"), str):
+                return parse_json_object(block["text"])
+        raise ProviderError("Claude returned no structured screening result")
+
+    def chat(
+        self, messages: Sequence[Mapping[str, Any]], tools: Sequence[ToolSpec]
+    ) -> AssistantReply:
+        system, converted = _anthropic_messages(messages)
+        body: dict[str, Any] = {
+            "model": self.model,
+            "max_tokens": self.max_tokens,
+            "messages": converted,
+        }
+        if system:
+            body["system"] = system
+        if tools:
+            body["tools"] = [
+                {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "input_schema": tool.parameters or {"type": "object", "properties": {}},
+                }
+                for tool in tools
+            ]
+        if self.selection.temperature is not None:
+            body["temperature"] = self.selection.temperature
+        raw = self._post("/v1/messages", body)
+        text_parts: list[str] = []
+        calls: list[ToolCall] = []
+        for block in raw.get("content", []):
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text" and isinstance(block.get("text"), str):
+                text_parts.append(block["text"])
+            elif block.get("type") == "tool_use":
+                calls.append(
+                    ToolCall(
+                        id=str(block.get("id") or f"call_{len(calls)}"),
+                        name=str(block.get("name", "")),
+                        arguments=_coerce_arguments(block.get("input")),
+                    )
+                )
+        return AssistantReply("".join(text_parts), tuple(calls))
+
+
+def _anthropic_messages(
+    messages: Sequence[Mapping[str, Any]]
+) -> tuple[str, list[dict[str, Any]]]:
+    """Split out the system prompt and fold tool results into user turns."""
+
+    system_parts: list[str] = []
+    converted: list[dict[str, Any]] = []
+    for message in messages:
+        role = message.get("role")
+        if role == "system":
+            system_parts.append(str(message.get("content", "")))
+            continue
+        if role == "tool":
+            block = {
+                "type": "tool_result",
+                "tool_use_id": message.get("tool_call_id", ""),
+                "content": str(message.get("content", "")),
+            }
+            if converted and converted[-1]["role"] == "user" and converted[-1].get("_tool_batch"):
+                converted[-1]["content"].append(block)
+            else:
+                converted.append({"role": "user", "content": [block], "_tool_batch": True})
+            continue
+        if role == "assistant":
+            blocks: list[dict[str, Any]] = []
+            content = str(message.get("content", ""))
+            if content:
+                blocks.append({"type": "text", "text": content})
+            for call in message.get("tool_calls") or []:
+                blocks.append(
+                    {
+                        "type": "tool_use",
+                        "id": call.id,
+                        "name": call.name,
+                        "input": call.arguments,
+                    }
+                )
+            if not blocks:
+                blocks.append({"type": "text", "text": "(no content)"})
+            converted.append({"role": "assistant", "content": blocks})
+            continue
+        converted.append(
+            {"role": "user", "content": [{"type": "text", "text": str(message.get("content", ""))}]}
+        )
+    for message in converted:
+        message.pop("_tool_batch", None)
+    return "\n\n".join(part for part in system_parts if part), converted
+
+
+CLIENTS = {
+    OLLAMA: OllamaClient,
+    OPENAI_CHAT: OpenAIChatClient,
+    OPENAI_RESPONSES: OpenAIResponsesClient,
+    ANTHROPIC: AnthropicClient,
+}
+
+
+def build_client(selection: ProviderSelection) -> ProviderClient:
+    return CLIENTS[selection.profile.api_style](selection)
+
+
+def describe_providers() -> list[dict[str, Any]]:
+    return [profile.to_dict() for profile in PROVIDERS.values()]
+
+
+def resolve_model(client: ProviderClient, requested: str, preferred: Iterable[str] = ()) -> str:
+    """Keep the requested model when the provider has it; otherwise pick a local fallback.
+
+    Only Ollama-style providers publish a trustworthy installed-model list, so a
+    hosted provider always keeps the requested id.
+    """
+
+    if not isinstance(client, OllamaClient):
+        return requested
+    installed = client.available_models()
+    if not installed:
+        return requested
+    if requested in installed:
+        return requested
+    for name in preferred:
+        if name in installed:
+            return name
+    base = requested.split(":")[0]
+    for name in installed:
+        if name.split(":")[0] == base:
+            return name
+    return installed[0]
+
+
+# -------------------------------------------------------------------------
 # email_triage/config.py
 # -------------------------------------------------------------------------
+
+__all__ = ["ConfigurationError", "Settings", "is_loopback_url"]
+
 
 class ConfigurationError(ValueError):
     """Raised when a required secure configuration value is missing."""
@@ -305,19 +1220,6 @@ def _bool(name: str, default: bool = False) -> bool:
     raise ConfigurationError(f"{name} must be true or false")
 
 
-def is_loopback_url(url: str) -> bool:
-    """True when inference stays on this machine (no email body leaves the host)."""
-
-    parsed = urlparse(url if "://" in url else f"http://{url}")
-    host = (parsed.hostname or "").lower()
-    if host in {"localhost", "127.0.0.1", "::1"}:
-        return True
-    try:
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        return False
-
-
 def _is_loopback_http_url(url: str) -> bool:
     """Validate a local browser-debugging endpoint without resolving DNS."""
     try:
@@ -333,15 +1235,112 @@ def _is_loopback_http_url(url: str) -> bool:
         return False
 
 
+def _float(name: str, default: float | None = None) -> float | None:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ConfigurationError(f"{name} must be a number") from exc
+    if not 0.0 <= value <= 2.0:
+        raise ConfigurationError(f"{name} must be between 0 and 2")
+    return value
+
+
+def _env_prefix(profile: ProviderProfile) -> str:
+    return profile.name.upper().replace("-", "_")
+
+
+def _first_env(*names: str) -> str:
+    for name in names:
+        value = os.getenv(name, "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _resolve_selection(
+    profile: ProviderProfile,
+    *,
+    prefix: str,
+    timeout: int,
+    temperature: float | None,
+    share_generic_env: bool = True,
+    override_base_url: str | None = None,
+    override_model: str | None = None,
+) -> ProviderSelection:
+    """Build one provider binding from the environment.
+
+    ``prefix`` is empty for screening and ``AGENT_`` for the sorting agent, so
+    ``TRIAGE_AGENT_MODEL`` overrides ``TRIAGE_MODEL`` for that role only.
+    """
+
+    vendor = _env_prefix(profile)
+    base_names = [f"TRIAGE_{prefix}BASE_URL"]
+    model_names = [f"TRIAGE_{prefix}MODEL"]
+    key_names = [f"TRIAGE_{prefix}API_KEY"]
+    if prefix and share_generic_env:
+        base_names.append("TRIAGE_BASE_URL")
+        model_names.append("TRIAGE_MODEL")
+        key_names.append("TRIAGE_API_KEY")
+    base_names.append(f"{vendor}_BASE_URL")
+    model_names.append(f"{vendor}_MODEL")
+    if profile.name == "ollama":
+        base_names.append("OLLAMA_HOST")
+
+    base_url = (override_base_url or "").strip() or _first_env(*base_names) or (
+        profile.default_base_url
+    )
+    model = (override_model or "").strip() or _first_env(*model_names) or profile.default_model
+    api_key = _first_env(*key_names) or api_key_from_environment(profile)
+    return ProviderSelection(
+        profile=profile,
+        base_url=base_url.rstrip("/"),
+        model=model,
+        api_key=api_key,
+        temperature=temperature,
+        timeout=timeout,
+    )
+
+
+def _require_credentials(selection: ProviderSelection, role: str) -> None:
+    profile = selection.profile
+    if not selection.base_url:
+        raise ConfigurationError(
+            f"{profile.label} needs a base URL for {role}. "
+            f"Set TRIAGE_BASE_URL or {_env_prefix(profile)}_BASE_URL."
+        )
+    if not selection.model:
+        raise ConfigurationError(
+            f"{profile.label} needs a model name for {role}. "
+            f"Set TRIAGE_MODEL or {_env_prefix(profile)}_MODEL."
+        )
+    if profile.requires_api_key and not selection.api_key:
+        variables = ", ".join(profile.api_key_env) or "TRIAGE_API_KEY"
+        raise ConfigurationError(f"Missing required environment variables: {variables}")
+
+
+def _approval_message(selection: ProviderSelection) -> str:
+    if selection.profile.local:
+        return (
+            f"{selection.base_url} is not a loopback address. Obtain institutional "
+            "privacy/security approval before transmitting email bodies to a remote "
+            "inference host."
+        )
+    return (
+        f"EXTERNAL_AI_APPROVED is false. Obtain institutional privacy/security "
+        f"approval before transmitting email bodies to an external AI service "
+        f"({selection.profile.label})."
+    )
+
+
 @dataclass(frozen=True)
 class Settings:
     tenant_id: str
     client_id: str
-    ai_backend: str
-    openai_api_key: str
-    openai_model: str
-    ollama_host: str
-    ollama_model: str
+    screening: ProviderSelection
+    agent: ProviderSelection
     external_ai_approved: bool
     intercept_clinical: bool
     mailbox_source: str
@@ -351,13 +1350,28 @@ class Settings:
     max_retrieval_pages: int
     max_body_characters: int
     output_dir: Path
+    agent_max_rounds: int = 4
     apply_changes: bool = False
     mark_read: bool = False
     use_agent: bool = True
 
     @property
+    def ai_provider(self) -> str:
+        return self.screening.profile.name
+
+    @property
+    def ai_backend(self) -> str:
+        """Historic alias for :attr:`ai_provider`."""
+
+        return self.ai_provider
+
+    @property
     def uses_local_inference(self) -> bool:
-        return self.ai_backend == "ollama" and is_loopback_url(self.ollama_host)
+        """True when no message text leaves this machine for either role."""
+
+        if not self.screening.keeps_data_local:
+            return False
+        return not self.use_agent or self.agent.keeps_data_local
 
     @classmethod
     def from_env(
@@ -367,6 +1381,11 @@ class Settings:
         mark_read: bool | None = None,
         use_agent: bool | None = None,
         source: str | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+        base_url: str | None = None,
+        agent_provider: str | None = None,
+        agent_model: str | None = None,
     ) -> "Settings":
         resolved_input = (input_path or os.getenv("TRIAGE_INPUT", "")).strip()
         tenant_id = os.getenv("MS_TENANT_ID", "").strip()
@@ -403,41 +1422,73 @@ class Settings:
                     "MS_CLIENT_ID."
                 )
 
-        backend = os.getenv("TRIAGE_BACKEND", "ollama").strip().lower() or "ollama"
-        if backend not in {"ollama", "openai"}:
-            raise ConfigurationError("TRIAGE_BACKEND must be ollama or openai")
-
-        ollama_host = (
-            os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434").strip()
-            or "http://127.0.0.1:11434"
-        )
-        ollama_model = os.getenv("OLLAMA_MODEL", "qwen3:8b").strip() or "qwen3:8b"
-        openai_api_key = os.getenv("OPENAI_API_KEY", "").strip()
-        openai_model = os.getenv("OPENAI_MODEL", "gpt-4o").strip() or "gpt-4o"
-        local_inference = backend == "ollama" and is_loopback_url(ollama_host)
-
-        if backend == "openai":
-            if not openai_api_key:
-                raise ConfigurationError("Missing required environment variables: OPENAI_API_KEY")
-            approved = _bool("EXTERNAL_AI_APPROVED")
-            if not approved:
-                raise ConfigurationError(
-                    "EXTERNAL_AI_APPROVED is false. Obtain institutional privacy/security "
-                    "approval before transmitting email bodies to an external AI service."
-                )
-        elif not local_inference:
-            approved = _bool("EXTERNAL_AI_APPROVED")
-            if not approved:
-                raise ConfigurationError(
-                    "OLLAMA_HOST is not loopback. Obtain institutional privacy/security "
-                    "approval before transmitting email bodies to a remote inference host."
-                )
-        else:
-            approved = False
-
         apply_enabled = _bool("TRIAGE_APPLY") if apply_changes is None else apply_changes
         mark_read_enabled = _bool("TRIAGE_MARK_READ") if mark_read is None else mark_read
         agent_enabled = _bool("TRIAGE_AGENT", True) if use_agent is None else use_agent
+
+        timeout = _positive_int("TRIAGE_REQUEST_TIMEOUT", 180)
+        temperature = _float("TRIAGE_TEMPERATURE")
+        requested_provider = (
+            provider or _first_env("TRIAGE_PROVIDER", "TRIAGE_BACKEND") or "ollama"
+        )
+        try:
+            screening_profile = provider_profile(requested_provider)
+        except KeyError as exc:
+            raise ConfigurationError(
+                f"Unknown AI provider {requested_provider!r}. "
+                f"Choose one of: {', '.join(PROVIDER_NAMES)}."
+            ) from exc
+        screening = _resolve_selection(
+            screening_profile,
+            prefix="",
+            timeout=timeout,
+            temperature=temperature,
+            override_base_url=base_url,
+            override_model=model,
+        )
+        _require_credentials(screening, "screening")
+
+        requested_agent = (
+            agent_provider
+            or _first_env("TRIAGE_AGENT_PROVIDER")
+            or screening_profile.name
+        )
+        try:
+            agent_profile = provider_profile(requested_agent)
+        except KeyError as exc:
+            raise ConfigurationError(
+                f"Unknown sorting-agent provider {requested_agent!r}. "
+                f"Choose one of: {', '.join(PROVIDER_NAMES)}."
+            ) from exc
+        agent_selection = _resolve_selection(
+            agent_profile,
+            prefix="AGENT_",
+            timeout=timeout,
+            temperature=temperature,
+            share_generic_env=agent_profile.name == screening_profile.name,
+            override_model=agent_model,
+        )
+        if agent_enabled:
+            if not agent_profile.supports_tools:
+                raise ConfigurationError(
+                    f"{agent_profile.label} cannot run the sorting agent. "
+                    "Use --no-agent or choose a tool-calling provider."
+                )
+            _require_credentials(agent_selection, "the sorting agent")
+
+        remote = [
+            selection
+            for selection in ((screening,) + ((agent_selection,) if agent_enabled else ()))
+            if not selection.keeps_data_local
+        ]
+        if remote:
+            approved = _bool("EXTERNAL_AI_APPROVED")
+            if not approved:
+                raise ConfigurationError(_approval_message(remote[0]))
+        else:
+            approved = False
+        local_inference = not remote
+
         if apply_enabled and mailbox_source == "local":
             raise ConfigurationError(
                 "--apply writes to the live Outlook mailbox and cannot be combined "
@@ -466,11 +1517,8 @@ class Settings:
         return cls(
             tenant_id=tenant_id,
             client_id=client_id,
-            ai_backend=backend,
-            openai_api_key=openai_api_key,
-            openai_model=openai_model,
-            ollama_host=ollama_host.rstrip("/"),
-            ollama_model=ollama_model,
+            screening=screening,
+            agent=agent_selection,
             external_ai_approved=approved,
             intercept_clinical=not local_inference,
             mailbox_source=mailbox_source,
@@ -480,6 +1528,7 @@ class Settings:
             max_retrieval_pages=_positive_int("MAX_RETRIEVAL_PAGES", 10),
             max_body_characters=_positive_int("MAX_BODY_CHARACTERS", 12_000),
             output_dir=Path(os.getenv("TRIAGE_OUTPUT_DIR", "var")).expanduser(),
+            agent_max_rounds=_positive_int("TRIAGE_AGENT_MAX_ROUNDS", 4),
             apply_changes=apply_enabled,
             mark_read=mark_read_enabled,
             use_agent=agent_enabled,
@@ -1070,6 +2119,15 @@ def local_manual_review_reason(body: str) -> ManualReviewReason | None:
 # email_triage/classifier.py
 # -------------------------------------------------------------------------
 
+"""Screening: one structured, schema-checked verdict per email body.
+
+The transport lives in :mod:`email_triage.providers`, so the same instructions
+and JSON schema are used whichever AI system the operator selects.
+"""
+
+
+
+
 PREFERRED_OLLAMA_MODELS = (
     "qwen3:14b",
     "qwen3:8b",
@@ -1078,6 +2136,8 @@ PREFERRED_OLLAMA_MODELS = (
     "qwen3:4b",
     "qwen3:0.6b",
 )
+
+SCREENING_SCHEMA_NAME = "email_screening"
 
 
 SYSTEM_INSTRUCTIONS = """You screen an incoming email body for a review-only Outlook workflow.
@@ -1155,170 +2215,51 @@ class ClassificationError(RuntimeError):
     """Raised when the model cannot produce a valid screening contract."""
 
 
-class OpenAIClassifier:
-    def __init__(self, api_key: str, model: str):
-        self.api_key = api_key
-        self.model = model
+class ProviderClassifier:
+    """Screen one email body through the selected provider."""
+
+    def __init__(self, client: ProviderClient):
+        self.client = client
+
+    @property
+    def model(self) -> str:
+        return self.client.model
+
+    @property
+    def provider(self) -> str:
+        return self.client.profile.name
 
     def classify(self, body: str, has_attachments: bool) -> ScreeningResult:
-        payload = {
-            "model": self.model,
-            "store": False,
-            "instructions": SYSTEM_INSTRUCTIONS,
-            "input": json.dumps(
-                {"email_body": body, "has_attachments": has_attachments},
-                ensure_ascii=False,
-            ),
-            "text": {
-                "format": {
-                    "type": "json_schema",
-                    "name": "email_screening",
-                    "strict": True,
-                    "schema": SCREENING_JSON_SCHEMA,
-                }
-            },
-        }
-        request = Request(
-            "https://api.openai.com/v1/responses",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
+        payload = json.dumps(
+            {"email_body": body, "has_attachments": has_attachments},
+            ensure_ascii=False,
         )
         try:
-            with urlopen(request, timeout=60) as response:
-                raw_response = json.load(response)
-        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as exc:
-            raise ClassificationError("OpenAI screening request failed") from exc
+            raw = self.client.complete_json(
+                SYSTEM_INSTRUCTIONS, payload, SCREENING_JSON_SCHEMA, SCREENING_SCHEMA_NAME
+            )
+        except ProviderError as exc:
+            raise ClassificationError(str(exc)) from exc
         try:
-            output_text = _extract_output_text(raw_response)
-            return ScreeningResult.from_dict(json.loads(output_text))
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise ClassificationError("OpenAI returned an invalid screening result") from exc
-
-
-class OllamaClassifier:
-    """Screen mail with a local Ollama model. Bodies are posted only to the configured host."""
-
-    def __init__(self, host: str, model: str):
-        self.host = host.rstrip("/")
-        self.model = model
-
-    def classify(self, body: str, has_attachments: bool) -> ScreeningResult:
-        payload = {
-            "model": self.model,
-            "stream": False,
-            "think": False,
-            "format": SCREENING_JSON_SCHEMA,
-            "messages": [
-                {"role": "system", "content": SYSTEM_INSTRUCTIONS},
-                {
-                    "role": "user",
-                    "content": json.dumps(
-                        {"email_body": body, "has_attachments": has_attachments},
-                        ensure_ascii=False,
-                    ),
-                },
-            ],
-        }
-        request = Request(
-            f"{self.host}/api/chat",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        try:
-            with urlopen(request, timeout=180) as response:
-                raw_response = json.load(response)
-        except HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            if exc.code == 404:
-                raise ClassificationError(
-                    f"Ollama model {self.model!r} is not installed. Run: ollama pull {self.model}"
-                ) from exc
-            raise ClassificationError(f"Ollama screening request failed: {detail}") from exc
-        except (URLError, TimeoutError, json.JSONDecodeError) as exc:
+            return ScreeningResult.from_dict(raw)
+        except (KeyError, TypeError, ValueError) as exc:
             raise ClassificationError(
-                f"Ollama is unavailable at {self.host}. Start it with `ollama serve`, "
-                f"then install a model with `ollama pull {self.model}`."
+                f"{self.client.profile.label} returned an invalid screening result"
             ) from exc
-        try:
-            content = raw_response.get("message", {}).get("content")
-            return ScreeningResult.from_dict(_parse_json_object(content))
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise ClassificationError("Ollama returned an invalid screening result") from exc
 
 
-def _extract_output_text(response: dict[str, Any]) -> str:
-    for item in response.get("output", []):
-        if item.get("type") != "message":
-            continue
-        for content in item.get("content", []):
-            if content.get("type") == "output_text" and isinstance(content.get("text"), str):
-                return content["text"]
-            if content.get("type") == "refusal":
-                raise ValueError("model refused the screening request")
-    raise ValueError("response did not contain output_text")
+def build_screening_client(settings: Settings) -> ProviderClient:
+    """Build the screening transport, pinning a locally installed model when needed."""
+
+    client = build_client(settings.screening)
+    resolved = resolve_model(client, settings.screening.model, PREFERRED_OLLAMA_MODELS)
+    if resolved != client.model:
+        client.model = resolved
+    return client
 
 
-def _parse_json_object(text: Any) -> dict[str, Any]:
-    if not isinstance(text, str) or not text.strip():
-        raise ValueError("empty model output")
-    stripped = text.strip()
-    try:
-        value = json.loads(stripped)
-    except json.JSONDecodeError:
-        start = stripped.find("{")
-        end = stripped.rfind("}")
-        if start == -1 or end <= start:
-            raise
-        value = json.loads(stripped[start : end + 1])
-    if not isinstance(value, dict):
-        raise ValueError("model output is not a JSON object")
-    return value
-
-
-def _list_ollama_models(host: str) -> list[str]:
-    request = Request(f"{host.rstrip('/')}/api/tags", method="GET")
-    try:
-        with urlopen(request, timeout=5) as response:
-            payload = json.load(response)
-    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
-        return []
-    names: list[str] = []
-    for item in payload.get("models", []):
-        name = item.get("name")
-        if isinstance(name, str) and name:
-            names.append(name)
-    return names
-
-
-def resolve_ollama_model(host: str, requested: str) -> str:
-    """Use the requested model when installed; otherwise pick the strongest local tag."""
-
-    installed = _list_ollama_models(host)
-    installed_set = set(installed)
-    if requested in installed_set:
-        return requested
-    for name in PREFERRED_OLLAMA_MODELS:
-        if name in installed_set:
-            return name
-    requested_base = requested.split(":")[0]
-    for name in installed:
-        if name.split(":")[0] == requested_base:
-            return name
-    if installed:
-        return installed[0]
-    return requested
-
-
-def build_classifier(settings: Settings) -> OpenAIClassifier | OllamaClassifier:
-    if settings.ai_backend == "ollama":
-        model = resolve_ollama_model(settings.ollama_host, settings.ollama_model)
-        return OllamaClassifier(settings.ollama_host, model)
-    return OpenAIClassifier(settings.openai_api_key, settings.openai_model)
+def build_classifier(settings: Settings) -> ProviderClassifier:
+    return ProviderClassifier(build_screening_client(settings))
 
 
 # -------------------------------------------------------------------------
@@ -1719,12 +2660,17 @@ def default_plan(record: ReviewRecord, allow_mark_read: bool) -> list[MailboxAct
 # email_triage/agent.py
 # -------------------------------------------------------------------------
 
-"""A local Ollama tool-calling agent that sorts already-screened messages.
+"""A tool-calling agent that sorts already-screened messages.
 
 The agent never sees the raw email body. It sees only the validated screening result,
 and it can only call tools that the policy gate in :mod:`email_triage.actions` permits
 for that specific message. Rejected calls are returned to the model as tool errors so
 it can correct itself; if it cannot, the deterministic plan is used instead.
+
+Any provider in :mod:`email_triage.providers` that supports tool calls can drive the
+agent. Tool specifications and the conversation are kept in a neutral shape and are
+translated per provider, so the policy gate stays the only authority over what a model
+can actually do.
 """
 
 
@@ -1755,71 +2701,56 @@ class AgentError(RuntimeError):
     """Raised when the local agent cannot be reached."""
 
 
-def build_tools(record: ReviewRecord, allow_mark_read: bool) -> list[dict[str, Any]]:
+def build_tools(record: ReviewRecord, allow_mark_read: bool) -> list[ToolSpec]:
     """Expose only the tools this message is allowed to use."""
 
-    tools: list[dict[str, Any]] = [
-        {
-            "type": "function",
-            "function": {
-                "name": str(ActionKind.TAG_MESSAGE),
-                "description": "Apply Outlook categories from the screening result.",
-                "parameters": {
-                    "type": "object",
-                    "required": ["categories"],
-                    "properties": {
-                        "categories": {
-                            "type": "array",
-                            "items": {"type": "string", "enum": list(record.categories)},
-                        }
-                    },
+    tools = [
+        ToolSpec(
+            name=str(ActionKind.TAG_MESSAGE),
+            description="Apply Outlook categories from the screening result.",
+            parameters={
+                "type": "object",
+                "required": ["categories"],
+                "properties": {
+                    "categories": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": list(record.categories)},
+                    }
                 },
             },
-        }
+        )
     ]
     if may_draft_reply(record):
         tools.append(
-            {
-                "type": "function",
-                "function": {
-                    "name": str(ActionKind.DRAFT_REPLY),
-                    "description": (
-                        "Create an unsent reply draft using the approved reply text. "
-                        "The text cannot be modified and the draft is never sent."
-                    ),
-                    "parameters": {"type": "object", "properties": {}},
-                },
-            }
+            ToolSpec(
+                name=str(ActionKind.DRAFT_REPLY),
+                description=(
+                    "Create an unsent reply draft using the approved reply text. "
+                    "The text cannot be modified and the draft is never sent."
+                ),
+                parameters={"type": "object", "properties": {}},
+            )
         )
     if may_mark_read(record, allow_mark_read):
         tools.append(
-            {
-                "type": "function",
-                "function": {
-                    "name": str(ActionKind.MARK_READ),
-                    "description": "Mark the original message as read.",
-                    "parameters": {"type": "object", "properties": {}},
-                },
-            }
+            ToolSpec(
+                name=str(ActionKind.MARK_READ),
+                description="Mark the original message as read.",
+                parameters={"type": "object", "properties": {}},
+            )
         )
     tools.append(
-        {
-            "type": "function",
-            "function": {
-                "name": str(ActionKind.FILE_MESSAGE),
-                "description": "Move the message into one triage folder. Call this last.",
-                "parameters": {
-                    "type": "object",
-                    "required": ["folder"],
-                    "properties": {
-                        "folder": {
-                            "type": "string",
-                            "enum": list(permitted_folders(record)),
-                        }
-                    },
+        ToolSpec(
+            name=str(ActionKind.FILE_MESSAGE),
+            description="Move the message into one triage folder. Call this last.",
+            parameters={
+                "type": "object",
+                "required": ["folder"],
+                "properties": {
+                    "folder": {"type": "string", "enum": list(permitted_folders(record))}
                 },
             },
-        }
+        )
     )
     return tools
 
@@ -1851,21 +2782,27 @@ def agent_briefing(record: ReviewRecord) -> str:
     )
 
 
-class OllamaSortingAgent:
-    """Plan mailbox actions with a local tool-calling model, bounded by the policy gate."""
+class SortingAgent:
+    """Plan mailbox actions with a tool-calling model, bounded by the policy gate."""
 
-    def __init__(self, host: str, model: str, max_rounds: int = 4, timeout: int = 180):
-        self.host = host.rstrip("/")
-        self.model = model
+    def __init__(self, client: ProviderClient, max_rounds: int = 4):
+        self.client = client
         self.max_rounds = max_rounds
-        self.timeout = timeout
+
+    @property
+    def provider(self) -> str:
+        return self.client.profile.name
+
+    @property
+    def model(self) -> str:
+        return self.client.model
 
     def plan(self, record: ReviewRecord, allow_mark_read: bool) -> tuple[list[MailboxAction], str]:
         """Return (plan, source) where source is 'agent' or 'deterministic'."""
 
         try:
             actions = self._run(record, allow_mark_read)
-        except (AgentError, ValueError):
+        except (AgentError, ProviderError, ValueError):
             actions = []
         if not any(action.kind == ActionKind.FILE_MESSAGE for action in actions):
             return default_plan(record, allow_mark_read), "deterministic"
@@ -1874,69 +2811,50 @@ class OllamaSortingAgent:
     def _run(self, record: ReviewRecord, allow_mark_read: bool) -> list[MailboxAction]:
         tools = build_tools(record, allow_mark_read)
         messages: list[dict[str, Any]] = [
-            {"role": "system", "content": AGENT_INSTRUCTIONS},
-            {"role": "user", "content": agent_briefing(record)},
+            system_message(AGENT_INSTRUCTIONS),
+            user_message(agent_briefing(record)),
         ]
         accepted: list[MailboxAction] = []
         for _ in range(self.max_rounds):
             reply = self._chat(messages, tools)
-            tool_calls = reply.get("tool_calls") or []
-            messages.append(reply)
-            if not tool_calls:
+            messages.append(assistant_message(reply))
+            if not reply.tool_calls:
                 break
-            for call in tool_calls:
-                function = call.get("function", {}) if isinstance(call, dict) else {}
-                name = function.get("name", "")
-                arguments = function.get("arguments") or {}
-                if isinstance(arguments, str):
-                    try:
-                        arguments = json.loads(arguments)
-                    except json.JSONDecodeError:
-                        arguments = {}
+            for call in reply.tool_calls:
                 try:
-                    action = action_from_tool_call(str(name), arguments)
+                    action = action_from_tool_call(call.name, call.arguments)
                     accepted.append(validate_action(action, record, allow_mark_read))
                     outcome = "accepted"
                 except PolicyViolation as exc:
                     outcome = f"rejected: {exc}"
-                messages.append({"role": "tool", "tool_name": str(name), "content": outcome})
+                messages.append(tool_message(call, outcome))
             if any(action.kind == ActionKind.FILE_MESSAGE for action in accepted):
                 break
         return accepted
 
-    def _chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> dict[str, Any]:
-        payload = {
-            "model": self.model,
-            "stream": False,
-            "think": False,
-            "messages": messages,
-            "tools": tools,
-        }
-        request = Request(
-            f"{self.host}/api/chat",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
+    def _chat(self, messages: list[dict[str, Any]], tools: list[ToolSpec]) -> AssistantReply:
         try:
-            with urlopen(request, timeout=self.timeout) as response:
-                raw = json.load(response)
-        except HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise AgentError(f"Ollama sorting agent request failed: {detail}") from exc
-        except (URLError, TimeoutError, json.JSONDecodeError) as exc:
-            raise AgentError(f"Ollama sorting agent is unavailable at {self.host}") from exc
-        message = raw.get("message")
-        if not isinstance(message, dict):
-            raise AgentError("Ollama sorting agent returned no message")
-        return message
+            return self.client.chat(messages, tools)
+        except ProviderError as exc:
+            raise AgentError(str(exc)) from exc
 
 
 class DeterministicSortingAgent:
     """Fallback planner used when the agent is disabled."""
 
+    provider = "none"
+    model = "deterministic"
+
     def plan(self, record: ReviewRecord, allow_mark_read: bool) -> tuple[list[MailboxAction], str]:
         return default_plan(record, allow_mark_read), "deterministic"
+
+
+def build_agent(settings: Settings) -> SortingAgent | DeterministicSortingAgent:
+    """Select the sorting agent named by the settings, or the deterministic planner."""
+
+    if not settings.use_agent:
+        return DeterministicSortingAgent()
+    return SortingAgent(build_client(settings.agent), max_rounds=settings.agent_max_rounds)
 
 
 # -------------------------------------------------------------------------
@@ -3295,6 +4213,42 @@ def build_parser() -> argparse.ArgumentParser:
         help="Mailbox source. --owa is the same as --source owa.",
     )
     parser.add_argument(
+        "--provider",
+        choices=PROVIDER_NAMES,
+        help=(
+            "AI system used for screening: ollama (default, local), openai, anthropic, "
+            "openrouter, opencode, lmstudio, gemini, groq, and more. Overrides TRIAGE_PROVIDER."
+        ),
+    )
+    parser.add_argument(
+        "--model",
+        help="Model id for the screening provider. Overrides TRIAGE_MODEL.",
+    )
+    parser.add_argument(
+        "--base-url",
+        help=(
+            "Base URL for the screening provider. Needed for self-hosted gateways, "
+            "Azure OpenAI deployments, and --provider custom."
+        ),
+    )
+    parser.add_argument(
+        "--agent-provider",
+        choices=PROVIDER_NAMES,
+        help="Run the sorting agent on a different AI system than screening.",
+    )
+    parser.add_argument(
+        "--agent-model",
+        help="Model id for the sorting agent when it differs from the screening model.",
+    )
+    parser.add_argument(
+        "--list-providers",
+        action="store_true",
+        help=(
+            "Print the supported AI systems with their default endpoints and key "
+            "variables as JSON, then exit. Nothing is contacted."
+        ),
+    )
+    parser.add_argument(
         "--diagnose",
         action="store_true",
         help=(
@@ -3377,6 +4331,35 @@ def _cli_source(args: argparse.Namespace) -> str | None:
     return args.source
 
 
+def _ai_report(args: argparse.Namespace) -> dict[str, object]:
+    """Describe the selected AI systems without contacting them."""
+
+    requested = args.provider or os.getenv("TRIAGE_PROVIDER", "") or os.getenv(
+        "TRIAGE_BACKEND", ""
+    ) or "ollama"
+    try:
+        settings = Settings.from_env(
+            input_path=args.input,
+            use_agent=False if args.no_agent else None,
+            source=_cli_source(args),
+            provider=args.provider,
+            model=args.model,
+            base_url=args.base_url,
+            agent_provider=args.agent_provider,
+            agent_model=args.agent_model,
+        )
+    except ConfigurationError as exc:
+        return {"configured": False, "provider": requested.strip().lower(), "detail": str(exc)}
+    return {
+        "configured": True,
+        "screening": settings.screening.to_dict(),
+        "sorting_agent": (
+            settings.agent.to_dict() if settings.use_agent else {"provider": "none"}
+        ),
+        "keeps_data_local": settings.uses_local_inference,
+    }
+
+
 def _diagnostic_report(args: argparse.Namespace) -> dict[str, object]:
     """Check backend readiness without reading mail, tokens, or model state."""
 
@@ -3390,7 +4373,10 @@ def _diagnostic_report(args: argparse.Namespace) -> dict[str, object]:
         raise ConfigurationError(
             "TRIAGE_SOURCE must be graph, local, owa, desktop, or accessibility"
         )
-    report: dict[str, object] = {"capabilities": backend_capabilities(source).to_dict()}
+    report: dict[str, object] = {
+        "capabilities": backend_capabilities(source).to_dict(),
+        "ai": _ai_report(args),
+    }
     if source == "owa":
         cdp_url = (
             os.getenv("EDGE_CDP_URL", "").strip()
@@ -3447,6 +4433,11 @@ def run(args: argparse.Namespace) -> int:
         mark_read=args.mark_read or None,
         use_agent=False if args.no_agent else None,
         source=_cli_source(args),
+        provider=args.provider,
+        model=args.model,
+        base_url=args.base_url,
+        agent_provider=args.agent_provider,
+        agent_model=args.agent_model,
     )
 
     if args.login:
@@ -3510,28 +4501,30 @@ def run(args: argparse.Namespace) -> int:
         mailbox_source = live_mailbox
 
     classifier = build_classifier(settings)
-    if settings.ai_backend == "ollama":
-        if not _list_ollama_models(settings.ollama_host):
-            raise ConfigurationError(
-                f"Ollama is unavailable at {settings.ollama_host} or has no models. "
-                "Start it with `ollama serve` and run `ollama pull qwen3:8b` "
-                "(best fit for 18GB Apple Silicon)."
-            )
-        location = "this machine" if settings.uses_local_inference else settings.ollama_host
+    ready, detail = classifier.client.reachable()
+    if not ready:
+        raise ConfigurationError(detail)
+    location = (
+        "this machine"
+        if settings.screening.keeps_data_local
+        else settings.screening.base_url
+    )
+    print(
+        f"Screening with {classifier.client.profile.label} model {classifier.model} "
+        f"at {location}.",
+        file=sys.stderr,
+    )
+
+    agent: SortingAgent | DeterministicSortingAgent = build_agent(settings)
+    if isinstance(agent, SortingAgent):
+        agent_location = (
+            "this machine" if settings.agent.keeps_data_local else settings.agent.base_url
+        )
         print(
-            f"Using Ollama model {classifier.model} at {location}. "
-            "Email bodies are not sent to OpenAI.",
+            f"Sorting agent: {agent.client.profile.label} model {agent.model} "
+            f"at {agent_location}. The agent never sees message bodies.",
             file=sys.stderr,
         )
-
-    agent: OllamaSortingAgent | DeterministicSortingAgent
-    if settings.use_agent:
-        agent = OllamaSortingAgent(
-            settings.ollama_host,
-            resolve_ollama_model(settings.ollama_host, settings.ollama_model),
-        )
-    else:
-        agent = DeterministicSortingAgent()
 
     actuator: GraphActuator | DryRunActuator
     if settings.apply_changes and live_mailbox is not None:
@@ -3608,6 +4601,9 @@ def _cli_main(argv: list[str] | None = None) -> int:
                 "Ignoring --input; --owa reads the live Outlook tab in Edge.",
                 file=sys.stderr,
             )
+        if args.list_providers:
+            print(json.dumps(describe_providers(), indent=2, sort_keys=True))
+            return 0
         if args.diagnose and args.live_probe:
             raise ConfigurationError("--diagnose and --live-probe are mutually exclusive")
         if args.diagnose:
@@ -3642,6 +4638,11 @@ def _cli_main(argv: list[str] | None = None) -> int:
             mark_read=args.mark_read or None,
             use_agent=False if args.no_agent else None,
             source=_cli_source(args),
+            provider=args.provider,
+            model=args.model,
+            base_url=args.base_url,
+            agent_provider=args.agent_provider,
+            agent_model=args.agent_model,
         )
         while True:
             try:
@@ -3706,6 +4707,307 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(result.confidence, Confidence.HIGH)
         self.assertEqual(result.urgency, Urgency.ROUTINE)
         self.assertEqual(result.topic, Topic.ADMINISTRATIVE)
+
+
+# -------------------------------------------------------------------------
+# tests/test_providers.py
+# -------------------------------------------------------------------------
+
+SCHEMA = {"type": "object", "properties": {"route": {"type": "string"}}}
+TOOLS = [
+    ToolSpec(
+        name="file_message",
+        description="Move the message into one triage folder.",
+        parameters={"type": "object", "properties": {"folder": {"type": "string"}}},
+    )
+]
+
+
+def selection(name: str, **overrides) -> ProviderSelection:
+    profile = provider_profile(name)
+    values = {
+        "base_url": profile.default_base_url,
+        "model": profile.default_model,
+        "api_key": "" if not profile.requires_api_key else "synthetic-key",
+    }
+    values.update(overrides)
+    return ProviderSelection(profile=profile, **values)
+
+
+class Recorder:
+    """Capture one outbound request and replay a canned response."""
+
+    def __init__(self, response):
+        self.response = response
+        self.url = ""
+        self.payload: dict = {}
+        self.headers: dict = {}
+
+    def __call__(self, request, timeout=None):
+        self.url = request.full_url
+        self.payload = json.loads(request.data) if request.data else {}
+        self.headers = dict(request.headers)
+        return io.BytesIO(json.dumps(self.response).encode())
+
+
+class RegistryTests(unittest.TestCase):
+    def test_registry_covers_the_documented_ai_systems(self) -> None:
+        for name in (
+            "ollama",
+            "openai",
+            "anthropic",
+            "openrouter",
+            "opencode",
+            "lmstudio",
+            "gemini",
+            "groq",
+            "azure-openai",
+            "custom",
+        ):
+            self.assertIn(name, PROVIDERS)
+        self.assertEqual(len(describe_providers()), len(PROVIDERS))
+
+    def test_friendly_aliases_resolve_to_registry_entries(self) -> None:
+        self.assertEqual(provider_profile("claude").name, "anthropic")
+        self.assertEqual(provider_profile("ChatGPT").name, "openai")
+        self.assertEqual(provider_profile("azure").name, "azure-openai")
+        with self.assertRaises(KeyError):
+            provider_profile("not-a-provider")
+
+    def test_only_loopback_local_providers_keep_data_on_this_machine(self) -> None:
+        self.assertTrue(selection("ollama").keeps_data_local)
+        self.assertFalse(
+            selection("ollama", base_url="http://ollama.example.org:11434").keeps_data_local
+        )
+        self.assertFalse(selection("openai").keeps_data_local)
+        self.assertTrue(selection("lmstudio").keeps_data_local)
+
+
+class ScreeningRoutingTests(unittest.TestCase):
+    def test_ollama_posts_the_schema_to_the_local_chat_endpoint(self) -> None:
+        recorder = Recorder({"message": {"content": json.dumps({"route": "no_reply"})}})
+        client = build_client(selection("ollama"))
+        with patch(__name__ + ".urlopen", recorder):
+            result = client.complete_json("instructions", "payload", SCHEMA, "email_screening")
+
+        self.assertEqual(recorder.url, "http://127.0.0.1:11434/api/chat")
+        self.assertEqual(recorder.payload["format"], SCHEMA)
+        self.assertFalse(recorder.payload["think"])
+        self.assertEqual(result, {"route": "no_reply"})
+
+    def test_openai_uses_the_responses_endpoint_with_a_strict_schema(self) -> None:
+        recorder = Recorder(
+            {
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [
+                            {"type": "output_text", "text": json.dumps({"route": "needs_reply"})}
+                        ],
+                    }
+                ]
+            }
+        )
+        client = build_client(selection("openai"))
+        with patch(__name__ + ".urlopen", recorder):
+            result = client.complete_json("instructions", "payload", SCHEMA, "email_screening")
+
+        self.assertEqual(recorder.url, "https://api.openai.com/v1/responses")
+        self.assertTrue(recorder.payload["text"]["format"]["strict"])
+        self.assertFalse(recorder.payload["store"])
+        self.assertEqual(recorder.headers["Authorization"], "Bearer synthetic-key")
+        self.assertEqual(result, {"route": "needs_reply"})
+
+    def test_anthropic_forces_a_single_structured_tool_call(self) -> None:
+        recorder = Recorder(
+            {"content": [{"type": "tool_use", "name": "email_screening", "input": {"route": "no_reply"}}]}
+        )
+        client = build_client(selection("anthropic"))
+        with patch(__name__ + ".urlopen", recorder):
+            result = client.complete_json("instructions", "payload", SCHEMA, "email_screening")
+
+        self.assertEqual(recorder.url, "https://api.anthropic.com/v1/messages")
+        self.assertEqual(recorder.payload["tool_choice"]["name"], "email_screening")
+        self.assertEqual(recorder.headers["X-api-key"], "synthetic-key")
+        self.assertEqual(recorder.headers["Anthropic-version"], "2023-06-01")
+        self.assertEqual(result, {"route": "no_reply"})
+
+    def test_openrouter_uses_chat_completions_with_a_json_schema(self) -> None:
+        recorder = Recorder(
+            {"choices": [{"message": {"content": json.dumps({"route": "needs_review"})}}]}
+        )
+        client = build_client(selection("openrouter"))
+        with patch(__name__ + ".urlopen", recorder):
+            result = client.complete_json("instructions", "payload", SCHEMA, "email_screening")
+
+        self.assertEqual(recorder.url, "https://openrouter.ai/api/v1/chat/completions")
+        self.assertEqual(recorder.payload["response_format"]["type"], "json_schema")
+        self.assertEqual(result, {"route": "needs_review"})
+
+    def test_providers_without_schema_support_get_the_schema_in_the_prompt(self) -> None:
+        recorder = Recorder(
+            {"choices": [{"message": {"content": "here you go: " + json.dumps({"route": "no_reply"})}}]}
+        )
+        client = build_client(selection("opencode"))
+        with patch(__name__ + ".urlopen", recorder):
+            result = client.complete_json("instructions", "payload", SCHEMA, "email_screening")
+
+        self.assertEqual(recorder.payload["response_format"], {"type": "json_object"})
+        self.assertIn('"route"', recorder.payload["messages"][0]["content"])
+        self.assertEqual(result, {"route": "no_reply"})
+
+    def test_azure_style_query_strings_survive_path_joining(self) -> None:
+        recorder = Recorder({"choices": [{"message": {"content": "{}"}}]})
+        client = build_client(
+            selection(
+                "azure-openai",
+                base_url="https://example.openai.azure.com/openai/deployments/gpt?api-version=2024-10-21",
+            )
+        )
+        with patch(__name__ + ".urlopen", recorder):
+            client.complete_json("instructions", "payload", SCHEMA, "email_screening")
+
+        self.assertEqual(
+            recorder.url,
+            "https://example.openai.azure.com/openai/deployments/gpt/chat/completions"
+            "?api-version=2024-10-21",
+        )
+        self.assertEqual(recorder.headers["Api-key"], "synthetic-key")
+
+    def test_unreachable_providers_raise_provider_error(self) -> None:
+        client = build_client(selection("ollama"))
+        with patch(__name__ + ".urlopen", side_effect=TimeoutError):
+            with self.assertRaises(ProviderError):
+                client.complete_json("instructions", "payload", SCHEMA, "email_screening")
+
+
+class ToolRoutingTests(unittest.TestCase):
+    """The neutral conversation must survive translation to every dialect."""
+
+    def conversation(self) -> list[dict]:
+        call = ToolCall(id="call_1", name="file_message", arguments={"folder": "AI Triage"})
+        return [
+            system_message("rules"),
+            user_message("briefing"),
+            assistant_message(AssistantReply("filing", (call,))),
+            tool_message(call, "accepted"),
+        ]
+
+    def test_ollama_tool_calls_round_trip(self) -> None:
+        recorder = Recorder(
+            {
+                "message": {
+                    "content": "",
+                    "tool_calls": [
+                        {"function": {"name": "file_message", "arguments": {"folder": "AI Triage"}}}
+                    ],
+                }
+            }
+        )
+        client = build_client(selection("ollama"))
+        with patch(__name__ + ".urlopen", recorder):
+            reply = client.chat(self.conversation(), TOOLS)
+
+        self.assertEqual(recorder.payload["tools"][0]["function"]["name"], "file_message")
+        self.assertEqual(recorder.payload["messages"][3]["tool_name"], "file_message")
+        self.assertEqual(reply.tool_calls[0].arguments, {"folder": "AI Triage"})
+
+    def test_openai_compatible_tool_calls_round_trip(self) -> None:
+        recorder = Recorder(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call_9",
+                                    "function": {
+                                        "name": "file_message",
+                                        "arguments": '{"folder": "AI Triage"}',
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ]
+            }
+        )
+        client = build_client(selection("groq"))
+        with patch(__name__ + ".urlopen", recorder):
+            reply = client.chat(self.conversation(), TOOLS)
+
+        sent = recorder.payload["messages"]
+        self.assertEqual(sent[2]["tool_calls"][0]["function"]["arguments"], '{"folder": "AI Triage"}')
+        self.assertEqual(sent[3], {"role": "tool", "tool_call_id": "call_1", "content": "accepted"})
+        self.assertEqual(reply.tool_calls[0].id, "call_9")
+        self.assertEqual(reply.tool_calls[0].arguments, {"folder": "AI Triage"})
+
+    def test_anthropic_tool_calls_round_trip_as_content_blocks(self) -> None:
+        recorder = Recorder(
+            {
+                "content": [
+                    {"type": "text", "text": "filing it"},
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "file_message",
+                        "input": {"folder": "AI Triage"},
+                    },
+                ]
+            }
+        )
+        client = build_client(selection("anthropic"))
+        with patch(__name__ + ".urlopen", recorder):
+            reply = client.chat(self.conversation(), TOOLS)
+
+        self.assertEqual(recorder.payload["system"], "rules")
+        self.assertEqual(recorder.payload["tools"][0]["input_schema"], TOOLS[0].parameters)
+        assistant = recorder.payload["messages"][1]
+        self.assertEqual(assistant["content"][1]["type"], "tool_use")
+        result_block = recorder.payload["messages"][2]["content"][0]
+        self.assertEqual(result_block["type"], "tool_result")
+        self.assertEqual(result_block["tool_use_id"], "call_1")
+        self.assertEqual(reply.content, "filing it")
+        self.assertEqual(reply.tool_calls[0].name, "file_message")
+
+    def test_consecutive_tool_results_are_merged_into_one_claude_turn(self) -> None:
+        first = ToolCall(id="a", name="tag_message", arguments={})
+        second = ToolCall(id="b", name="file_message", arguments={})
+        messages = [
+            system_message("rules"),
+            user_message("briefing"),
+            assistant_message(AssistantReply("", (first, second))),
+            tool_message(first, "accepted"),
+            tool_message(second, "accepted"),
+        ]
+        recorder = Recorder({"content": [{"type": "text", "text": "done"}]})
+        client = build_client(selection("anthropic"))
+        with patch(__name__ + ".urlopen", recorder):
+            client.chat(messages, TOOLS)
+
+        self.assertEqual(len(recorder.payload["messages"]), 3)
+        self.assertEqual(len(recorder.payload["messages"][2]["content"]), 2)
+
+
+class ModelResolutionTests(unittest.TestCase):
+    def test_ollama_falls_back_to_the_strongest_installed_tag(self) -> None:
+        client = build_client(selection("ollama"))
+        listing = Recorder({"models": [{"name": "qwen3:0.6b"}, {"name": "qwen3:8b"}]})
+        with patch(__name__ + ".urlopen", listing):
+            self.assertEqual(resolve_model(client, "qwen3:8b", ("qwen3:8b",)), "qwen3:8b")
+            self.assertEqual(resolve_model(client, "missing:model", ("qwen3:8b",)), "qwen3:8b")
+
+    def test_hosted_providers_keep_the_requested_model(self) -> None:
+        client = build_client(selection("openrouter"))
+        with patch(__name__ + ".urlopen", side_effect=AssertionError("no listing")):
+            self.assertEqual(resolve_model(client, "anthropic/claude-sonnet-4.5"), "anthropic/claude-sonnet-4.5")
+
+    def test_missing_keys_are_reported_before_any_request(self) -> None:
+        client = build_client(selection("openai", api_key=""))
+        ready, detail = client.reachable()
+        self.assertFalse(ready)
+        self.assertIn("OPENAI_API_KEY", detail)
 
 
 # -------------------------------------------------------------------------
@@ -3792,6 +5094,86 @@ class ConfigurationTests(unittest.TestCase):
             self.assertEqual(settings.mailbox_source, "accessibility")
             with self.assertRaisesRegex(ConfigurationError, "read-only"):
                 Settings.from_env(source="accessibility", apply_changes=True)
+
+
+class ProviderSettingsTests(unittest.TestCase):
+    BASE = {"TRIAGE_INPUT": "samples/inbox.jsonl"}
+
+    def test_provider_defaults_come_from_the_registry(self) -> None:
+        environment = {**self.BASE, "TRIAGE_PROVIDER": "anthropic",
+                       "ANTHROPIC_API_KEY": "synthetic-key", "EXTERNAL_AI_APPROVED": "true"}
+        with patch.dict("os.environ", environment, clear=True):
+            settings = Settings.from_env()
+        self.assertEqual(settings.ai_provider, "anthropic")
+        self.assertEqual(settings.screening.base_url, "https://api.anthropic.com")
+        self.assertEqual(settings.screening.model, "claude-sonnet-4-5")
+        self.assertEqual(settings.screening.api_key, "synthetic-key")
+        self.assertFalse(settings.uses_local_inference)
+        self.assertTrue(settings.intercept_clinical)
+
+    def test_backend_alias_and_friendly_names_still_select_a_provider(self) -> None:
+        environment = {**self.BASE, "TRIAGE_BACKEND": "claude",
+                       "CLAUDE_API_KEY": "synthetic-key", "EXTERNAL_AI_APPROVED": "true"}
+        with patch.dict("os.environ", environment, clear=True):
+            settings = Settings.from_env()
+        self.assertEqual(settings.ai_provider, "anthropic")
+
+    def test_explicit_overrides_beat_environment_defaults(self) -> None:
+        environment = {**self.BASE, "TRIAGE_PROVIDER": "ollama", "OLLAMA_MODEL": "qwen3:8b"}
+        with patch.dict("os.environ", environment, clear=True):
+            settings = Settings.from_env(model="llama3.1:8b", base_url="http://localhost:11500")
+        self.assertEqual(settings.screening.model, "llama3.1:8b")
+        self.assertEqual(settings.screening.base_url, "http://localhost:11500")
+        self.assertTrue(settings.uses_local_inference)
+
+    def test_unknown_provider_is_rejected_with_the_supported_list(self) -> None:
+        with patch.dict("os.environ", {**self.BASE, "TRIAGE_PROVIDER": "hal9000"}, clear=True):
+            with self.assertRaisesRegex(ConfigurationError, "Unknown AI provider"):
+                Settings.from_env()
+
+    def test_a_remote_sorting_agent_also_needs_approval(self) -> None:
+        environment = {**self.BASE, "TRIAGE_PROVIDER": "ollama",
+                       "TRIAGE_AGENT_PROVIDER": "openai", "OPENAI_API_KEY": "synthetic-key"}
+        with patch.dict("os.environ", environment, clear=True):
+            with self.assertRaisesRegex(ConfigurationError, "privacy/security approval"):
+                Settings.from_env()
+            settings = Settings.from_env(use_agent=False)
+        self.assertTrue(settings.uses_local_inference)
+
+    def test_agent_overrides_apply_only_to_the_agent(self) -> None:
+        environment = {
+            **self.BASE,
+            "TRIAGE_PROVIDER": "ollama",
+            "TRIAGE_MODEL": "qwen3:14b",
+            "TRIAGE_AGENT_MODEL": "qwen3:4b",
+        }
+        with patch.dict("os.environ", environment, clear=True):
+            settings = Settings.from_env()
+        self.assertEqual(settings.screening.model, "qwen3:14b")
+        self.assertEqual(settings.agent.model, "qwen3:4b")
+        self.assertEqual(settings.agent.base_url, settings.screening.base_url)
+
+    def test_missing_hosted_key_is_reported_before_anything_is_contacted(self) -> None:
+        with patch.dict("os.environ", {**self.BASE, "TRIAGE_PROVIDER": "groq"}, clear=True):
+            with self.assertRaisesRegex(ConfigurationError, "GROQ_API_KEY"):
+                Settings.from_env()
+
+    def test_request_tuning_is_read_from_the_environment(self) -> None:
+        environment = {
+            **self.BASE,
+            "TRIAGE_PROVIDER": "ollama",
+            "TRIAGE_TEMPERATURE": "0.4",
+            "TRIAGE_REQUEST_TIMEOUT": "45",
+            "TRIAGE_AGENT_MAX_ROUNDS": "6",
+        }
+        with patch.dict("os.environ", environment, clear=True):
+            settings = Settings.from_env()
+        self.assertEqual(settings.screening.temperature, 0.4)
+        self.assertEqual(settings.screening.timeout, 45)
+        self.assertEqual(settings.agent_max_rounds, 6)
+        with patch.dict("os.environ", {**environment, "TRIAGE_TEMPERATURE": "9"}, clear=True):
+            with self.assertRaisesRegex(ConfigurationError, "between 0 and 2"):
+                Settings.from_env()
 
 
 # -------------------------------------------------------------------------
@@ -4047,13 +5429,23 @@ RESULT = {
 }
 
 
+def classifier_for(provider: str, **overrides) -> ProviderClassifier:
+    profile = provider_profile(provider)
+    selection = ProviderSelection(
+        profile=profile,
+        base_url=overrides.get("base_url", profile.default_base_url),
+        model=overrides.get("model", profile.default_model),
+        api_key="synthetic-key" if profile.requires_api_key else "",
+    )
+    return ProviderClassifier(build_client(selection))
+
+
 class ClassifierTests(unittest.TestCase):
-    def test_rest_request_uses_strict_schema_and_body_only_payload(self):
+    def test_openai_request_uses_strict_schema_and_body_only_payload(self):
         captured = {}
 
-        def fake_urlopen(request, timeout):
+        def fake_urlopen(request, timeout=None):
             captured["request"] = request
-            captured["timeout"] = timeout
             response = {
                 "output": [
                     {
@@ -4065,9 +5457,7 @@ class ClassifierTests(unittest.TestCase):
             return io.BytesIO(json.dumps(response).encode())
 
         with patch(__name__ + ".urlopen", fake_urlopen):
-            result = OpenAIClassifier("synthetic-key", "gpt-4o").classify(
-                "Can we meet next Tuesday?", True
-            )
+            result = classifier_for("openai").classify("Can we meet next Tuesday?", True)
 
         request_payload = json.loads(captured["request"].data)
         model_input = json.loads(request_payload["input"])
@@ -4080,37 +5470,59 @@ class ClassifierTests(unittest.TestCase):
     def test_ollama_request_stays_on_local_host_and_disables_thinking(self):
         captured = {}
 
-        def fake_urlopen(request, timeout):
+        def fake_urlopen(request, timeout=None):
             captured["url"] = request.full_url
             captured["payload"] = json.loads(request.data)
-            captured["timeout"] = timeout
-            response = {"message": {"content": json.dumps(RESULT)}}
-            return io.BytesIO(json.dumps(response).encode())
+            return io.BytesIO(json.dumps({"message": {"content": json.dumps(RESULT)}}).encode())
 
         with patch(__name__ + ".urlopen", fake_urlopen):
-            result = OllamaClassifier("http://127.0.0.1:11434", "qwen3:8b").classify(
-                "Can we meet next Tuesday?", True
-            )
+            result = classifier_for("ollama").classify("Can we meet next Tuesday?", True)
 
         self.assertEqual(captured["url"], "http://127.0.0.1:11434/api/chat")
         self.assertFalse(captured["payload"]["think"])
         self.assertEqual(captured["payload"]["format"]["type"], "object")
         self.assertEqual(result.route, Route.NEEDS_REPLY)
 
-    def test_resolve_ollama_model_prefers_strongest_installed_tag(self):
-        def fake_urlopen(request, timeout=None):
-            response = {"models": [{"name": "qwen3:0.6b"}, {"name": "qwen3:8b"}]}
-            return io.BytesIO(json.dumps(response).encode())
+    def test_every_provider_produces_the_same_screening_contract(self):
+        responses = {
+            "ollama": {"message": {"content": json.dumps(RESULT)}},
+            "anthropic": {"content": [{"type": "tool_use", "input": RESULT}]},
+            "openrouter": {"choices": [{"message": {"content": json.dumps(RESULT)}}]},
+            "gemini": {"choices": [{"message": {"content": json.dumps(RESULT)}}]},
+        }
+        for provider, response in responses.items():
+            with self.subTest(provider=provider):
+                with patch(
+                    __name__ + ".urlopen",
+                    lambda request, timeout=None, response=response: io.BytesIO(
+                        json.dumps(response).encode()
+                    ),
+                ):
+                    result = classifier_for(provider).classify("Can we meet?", False)
+                self.assertEqual(result.route, Route.NEEDS_REPLY)
+                self.assertEqual(result.priority_score, 3)
 
-        with patch(__name__ + ".urlopen", fake_urlopen):
-            self.assertEqual(
-                resolve_ollama_model("http://127.0.0.1:11434", "qwen3:8b"),
-                "qwen3:8b",
-            )
-            self.assertEqual(
-                resolve_ollama_model("http://127.0.0.1:11434", "missing:model"),
-                "qwen3:8b",
-            )
+    def test_transport_failures_surface_as_classification_errors(self):
+        with patch(__name__ + ".urlopen", side_effect=TimeoutError):
+            with self.assertRaises(ClassificationError):
+                classifier_for("ollama").classify("Can we meet?", False)
+
+    def test_build_classifier_pins_an_installed_local_model(self):
+        environment = {
+            "TRIAGE_PROVIDER": "ollama",
+            "OLLAMA_MODEL": "missing:model",
+            "TRIAGE_INPUT": "samples/inbox.jsonl",
+        }
+        listing = {"models": [{"name": "qwen3:8b"}]}
+        with patch.dict("os.environ", environment, clear=True):
+            settings = Settings.from_env()
+        with patch(
+            __name__ + ".urlopen",
+            lambda request, timeout=None: io.BytesIO(json.dumps(listing).encode()),
+        ):
+            classifier = build_classifier(settings)
+        self.assertEqual(classifier.model, "qwen3:8b")
+        self.assertEqual(classifier.provider, "ollama")
 
 
 # -------------------------------------------------------------------------
@@ -5000,7 +6412,7 @@ class PolicyTests(unittest.TestCase):
 # -------------------------------------------------------------------------
 
 class FakeChat:
-    """Replay scripted Ollama assistant messages."""
+    """Replay scripted assistant replies, whatever the provider dialect."""
 
     def __init__(self, replies):
         self.replies = list(replies)
@@ -5009,23 +6421,31 @@ class FakeChat:
     def __call__(self, messages, tools):
         self.seen.append(list(messages))
         if not self.replies:
-            return {"role": "assistant", "content": "done"}
+            return AssistantReply("done")
         return self.replies.pop(0)
 
 
 def tool_call(name, arguments=None):
-    return {
-        "role": "assistant",
-        "content": "",
-        "tool_calls": [{"function": {"name": name, "arguments": arguments or {}}}],
-    }
+    return AssistantReply(
+        "", (ToolCall(id=f"call_{name}", name=name, arguments=arguments or {}),)
+    )
+
+
+def client_for(provider="ollama"):
+    profile = provider_profile(provider)
+    return build_client(
+        ProviderSelection(
+            profile=profile,
+            base_url=profile.default_base_url,
+            model=profile.default_model,
+            api_key="synthetic-key" if profile.requires_api_key else "",
+        )
+    )
 
 
 class AgentTests(unittest.TestCase):
-    def agent(self, replies) -> tuple[OllamaSortingAgent, FakeChat]:
-        agent = OllamaSortingAgent("http://127.0.0.1:11434", "qwen3:8b")
-        chat = FakeChat(replies)
-        return agent, chat
+    def agent(self, replies, provider="ollama") -> tuple[SortingAgent, FakeChat]:
+        return SortingAgent(client_for(provider)), FakeChat(replies)
 
     def test_agent_plan_is_used_when_it_files_the_message(self) -> None:
         record = needs_reply_record()
@@ -5036,7 +6456,7 @@ class AgentTests(unittest.TestCase):
                 tool_call("file_message", {"folder": "AI Triage/Needs Reply"}),
             ]
         )
-        with patch.object(OllamaSortingAgent, "_chat", side_effect=chat):
+        with patch.object(SortingAgent, "_chat", side_effect=chat):
             plan, source = agent.plan(record, allow_mark_read=False)
         self.assertEqual(source, "agent")
         self.assertEqual(
@@ -5052,7 +6472,7 @@ class AgentTests(unittest.TestCase):
                 tool_call("file_message", {"folder": "AI Triage/Needs Review"}),
             ]
         )
-        with patch.object(OllamaSortingAgent, "_chat", side_effect=chat):
+        with patch.object(SortingAgent, "_chat", side_effect=chat):
             plan, source = agent.plan(record, allow_mark_read=False)
         self.assertEqual(source, "agent")
         self.assertEqual(plan[-1].folder, "AI Triage/Needs Review")
@@ -5072,14 +6492,14 @@ class AgentTests(unittest.TestCase):
                 tool_call("file_message", {"folder": "AI Triage/Needs Reply"}),
             ]
         )
-        with patch.object(OllamaSortingAgent, "_chat", side_effect=chat):
+        with patch.object(SortingAgent, "_chat", side_effect=chat):
             plan, _ = agent.plan(record, allow_mark_read=False)
         self.assertEqual([action.kind for action in plan], [ActionKind.FILE_MESSAGE])
 
     def test_missing_file_action_falls_back_to_the_deterministic_plan(self) -> None:
         record = needs_reply_record()
-        agent, chat = self.agent([{"role": "assistant", "content": "I am not sure."}])
-        with patch.object(OllamaSortingAgent, "_chat", side_effect=chat):
+        agent, chat = self.agent([AssistantReply("I am not sure.")])
+        with patch.object(SortingAgent, "_chat", side_effect=chat):
             plan, source = agent.plan(record, allow_mark_read=False)
         self.assertEqual(source, "deterministic")
         self.assertEqual(plan[-1].folder, record.target_folder)
@@ -5091,16 +6511,64 @@ class AgentTests(unittest.TestCase):
         self.assertIn("untrusted_subject", briefing)
 
     def test_tool_surface_is_restricted_per_message(self) -> None:
-        names = {
-            tool["function"]["name"]
-            for tool in build_tools(clinical_record(), allow_mark_read=True)
-        }
+        names = {tool.name for tool in build_tools(clinical_record(), allow_mark_read=True)}
         self.assertEqual(names, {"tag_message", "file_message"})
         reply_names = {
-            tool["function"]["name"]
-            for tool in build_tools(needs_reply_record(), allow_mark_read=True)
+            tool.name for tool in build_tools(needs_reply_record(), allow_mark_read=True)
         }
         self.assertEqual(reply_names, {"tag_message", "draft_reply", "mark_read", "file_message"})
+
+    def test_any_tool_calling_provider_can_drive_the_same_plan(self) -> None:
+        record = needs_reply_record()
+        for provider in ("ollama", "anthropic", "openrouter", "openai"):
+            with self.subTest(provider=provider):
+                agent, chat = self.agent(
+                    [
+                        tool_call("tag_message", {"categories": list(record.categories)}),
+                        tool_call("file_message", {"folder": "AI Triage/Needs Reply"}),
+                    ],
+                    provider=provider,
+                )
+                with patch.object(SortingAgent, "_chat", side_effect=chat):
+                    plan, source = agent.plan(record, allow_mark_read=False)
+                self.assertEqual(source, "agent")
+                self.assertEqual(plan[-1].folder, "AI Triage/Needs Reply")
+
+    def test_unreachable_provider_falls_back_to_the_deterministic_plan(self) -> None:
+        record = needs_reply_record()
+        agent = SortingAgent(client_for("anthropic"))
+        with patch(
+            __name__ + ".urlopen", side_effect=TimeoutError
+        ):
+            plan, source = agent.plan(record, allow_mark_read=False)
+        self.assertEqual(source, "deterministic")
+        self.assertEqual(plan[-1].folder, record.target_folder)
+
+    def test_build_agent_honours_a_separate_sorting_provider(self) -> None:
+        environment = {
+            "TRIAGE_PROVIDER": "ollama",
+            "TRIAGE_AGENT_PROVIDER": "anthropic",
+            "ANTHROPIC_API_KEY": "synthetic-key",
+            "EXTERNAL_AI_APPROVED": "true",
+            "TRIAGE_INPUT": "samples/inbox.jsonl",
+        }
+        with patch.dict("os.environ", environment, clear=True):
+            settings = Settings.from_env()
+        agent = build_agent(settings)
+        self.assertIsInstance(agent, SortingAgent)
+        self.assertEqual(agent.provider, "anthropic")
+
+    def test_disabled_agent_never_contacts_a_provider(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {"TRIAGE_PROVIDER": "ollama", "TRIAGE_INPUT": "samples/inbox.jsonl"},
+            clear=True,
+        ):
+            settings = Settings.from_env(use_agent=False)
+        agent = build_agent(settings)
+        plan, source = agent.plan(needs_reply_record(), allow_mark_read=False)
+        self.assertEqual(source, "deterministic")
+        self.assertTrue(plan)
 
 
 # -------------------------------------------------------------------------
@@ -5564,14 +7032,12 @@ class LiveProbeBoundaryTests(unittest.TestCase):
         output = io.StringIO()
         with patch(__name__ + ".run_live_probe", return_value=result), patch(
             __name__ + ".build_classifier"
-        ) as classifier, patch(
-            __name__ + "._list_ollama_models"
-        ) as models, redirect_stdout(output):
+        ) as classifier, patch(__name__ + ".build_agent") as agent, redirect_stdout(output):
             status = main(["--source", "graph", "--live-probe"])
         self.assertEqual(status, 0)
         self.assertEqual(json.loads(output.getvalue()), result.to_dict())
         classifier.assert_not_called()
-        models.assert_not_called()
+        agent.assert_not_called()
 
     def test_cli_rejects_implicit_local_and_operational_flags(self) -> None:
         cases = [

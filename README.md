@@ -6,8 +6,10 @@ completed reliability/privacy backlog and prohibited-feature boundaries.
 Reads unread Inbox mail through the user's normal Outlook Web session by default—
 no Graph app registration, tenant ID, client ID, API key, or administrator
 approval required. Microsoft Graph remains an optional organization-approved
-backend. Each message is screened by a **local Ollama model**, and a **local
-tool-calling agent** can sort mail into triage folders with unsent reply drafts.
+backend. Each message is screened by the **AI system you choose** — local Ollama by
+default, or Claude, ChatGPT, OpenRouter, OpenCode, LM Studio, Gemini, Groq and
+others — and a **tool-calling agent** sorts mail into triage folders with unsent
+reply drafts.
 
 Nothing is ever sent, forwarded, or deleted. The application does not hold the `Mail.Send` scope, and no send/forward/delete call exists anywhere in the code (enforced by a test).
 
@@ -16,7 +18,17 @@ Nothing is ever sent, forwarded, or deleted. The application does not hold the `
 Mail Triage includes a native SwiftUI application with:
 
 - credential-free Outlook on the Web setup and readiness diagnostics;
-- local Ollama configuration and automatic model selection;
+- an **AI Providers** screen for connecting Ollama, Claude, ChatGPT, OpenRouter,
+  OpenCode, LM Studio, llama.cpp, Azure OpenAI, Gemini, Groq, Mistral, DeepSeek,
+  Together, xAI, or any OpenAI-compatible endpoint, with per-provider readiness
+  checks and automatic model discovery for local servers;
+- API keys stored in the login keychain, with environment variables as a fallback;
+- a separate provider for the sorting agent when screening and filing should not
+  run on the same system;
+- request tuning: model, base URL, temperature, timeout, agent tool rounds,
+  message and body limits, and mailbox pages scanned;
+- scheduled automatic preview runs, plus JSON/CSV export and route/search
+  filtering of results;
 - preview and explicitly confirmed apply modes;
 - a results browser for routes, priorities, summaries, action items, suggested
   replies, and planned/applied actions;
@@ -56,22 +68,64 @@ does not request a tenant ID, client ID, Graph secret, or administrator bypass.
 | Stage | Component | Data leaving the machine |
 | --- | --- | --- |
 | Read unread mail | Outlook-in-Edge session (`--owa`) or Microsoft Graph | Microsoft only |
-| Screen + draft reply | Ollama on `127.0.0.1` | none |
-| Plan mailbox actions | Ollama tool-calling agent | none |
+| Screen + draft reply | the selected provider (default: Ollama on `127.0.0.1`) | none for local providers |
+| Plan mailbox actions | the selected sorting-agent provider | none for local providers |
 | Apply actions | Outlook-in-Edge or Microsoft Graph | Microsoft only |
 
-`TRIAGE_BACKEND=openai` is still available for screening, but it requires a key and an explicit `EXTERNAL_AI_APPROVED=true`. The sorting agent is always local.
+Local providers (Ollama, LM Studio, llama.cpp, OpenCode) keep every message body
+on this machine. Any hosted provider — and any local provider pointed at a
+non-loopback address — requires an explicit `EXTERNAL_AI_APPROVED=true` and an API
+key before a run can start.
+
+## Connecting an AI system
+
+`python email_triage_standalone.py --list-providers` prints every supported system
+with its default endpoint, default model, and key variable. Select one per run:
+
+```bash
+# Local, the default: nothing leaves the machine.
+python email_triage_standalone.py --owa
+
+# Claude for screening.
+ANTHROPIC_API_KEY=... EXTERNAL_AI_APPROVED=true \
+  python email_triage_standalone.py --owa --provider anthropic --model claude-sonnet-4-5
+
+# ChatGPT for screening, local Ollama for the sorting agent.
+OPENAI_API_KEY=... EXTERNAL_AI_APPROVED=true \
+  python email_triage_standalone.py --owa --provider openai --agent-provider ollama
+
+# Any OpenAI-compatible gateway (OpenCode, LM Studio, a self-hosted router).
+python email_triage_standalone.py --owa --provider custom \
+  --base-url http://127.0.0.1:4096/v1 --model my-model
+```
+
+| Setting | Environment variable | Flag |
+| --- | --- | --- |
+| Screening provider | `TRIAGE_PROVIDER` (alias `TRIAGE_BACKEND`) | `--provider` |
+| Screening model | `TRIAGE_MODEL`, or `<VENDOR>_MODEL` | `--model` |
+| Screening endpoint | `TRIAGE_BASE_URL`, or `<VENDOR>_BASE_URL` / `OLLAMA_HOST` | `--base-url` |
+| Screening key | `TRIAGE_API_KEY`, or the vendor variable (`ANTHROPIC_API_KEY`, …) | — |
+| Sorting-agent provider | `TRIAGE_AGENT_PROVIDER` | `--agent-provider` |
+| Sorting-agent model | `TRIAGE_AGENT_MODEL` | `--agent-model` |
+| Sampling temperature | `TRIAGE_TEMPERATURE` | — |
+| Request timeout, tool rounds | `TRIAGE_REQUEST_TIMEOUT`, `TRIAGE_AGENT_MAX_ROUNDS` | — |
+
+`src/email_triage/providers.py` translates one neutral request shape into each
+vendor dialect: Ollama's `/api/chat`, OpenAI's `/responses`, Anthropic's
+`/v1/messages`, and OpenAI-compatible `/chat/completions`. Screening always asks
+for the same JSON schema, and the sorting agent's tool calls and tool results are
+translated per provider, so routing behavior does not change with the vendor.
 
 ## The sorting agent, and what bounds it
 
-`src/email_triage/agent.py` runs a real tool-calling loop against Ollama. It is deliberately fenced in:
+`src/email_triage/agent.py` runs a real tool-calling loop against the selected provider. It is deliberately fenced in:
 
 - **It never sees the email body.** It receives only the validated screening result, plus the sender address and a truncated subject explicitly labelled untrusted.
 - **Its tool surface is computed per message.** A clinical or low-confidence message is offered only `tag_message` and `file_message`, and `file_message`'s folder enum contains just `AI Triage/Needs Review`. `draft_reply` is not offered at all unless screening produced an approved reply.
 - **Reply text cannot be rewritten.** The draft body must match the screened `suggested_reply` verbatim; the agent decides only *whether* to create the draft.
 - **Every call is re-validated after the fact** by the policy gate in `src/email_triage/actions.py`. Rejections are returned to the model as tool errors so it can correct itself.
 - **Send, forward, and delete are not representable.** There is no such tool and no such Graph call, so no prompt in an email body can produce one.
-- **If the agent stalls, misbehaves, or Ollama is down**, the deterministic plan derived from the screening result is used instead. The `plan_source` field on every record records which one ran.
+- **If the agent stalls, misbehaves, or its provider is unreachable**, the deterministic plan derived from the screening result is used instead. The `plan_source` field on every record records which one ran.
 
 ## Preserved screening behavior
 
@@ -99,7 +153,7 @@ Skip this entire section when using the default credential-free Outlook Web path
 
 Changing between read and read-write invalidates the cached token, so the device-code prompt appears again on the first `--apply` run. If Conditional Access blocks device code, use the organization's approved brokered or browser-based OAuth flow rather than requesting an exception.
 
-Before sending mailbox content anywhere off-device (the `openai` backend, or a non-loopback `OLLAMA_HOST`), obtain institutional privacy/security approval. This repository does not itself establish compliance.
+Before sending mailbox content anywhere off-device (any hosted provider, or a non-loopback local endpoint), obtain institutional privacy/security approval. This repository does not itself establish compliance.
 
 ## Install
 
@@ -107,7 +161,8 @@ Before sending mailbox content anywhere off-device (the `openai` backend, or a n
 python3 -m venv .venv && source .venv/bin/activate && python -m pip install -e .
 ```
 
-The runtime uses only the Python standard library. Ollama must be running locally:
+The runtime uses only the Python standard library. For the default local path,
+Ollama must be running:
 
 ```bash
 ollama serve && ollama pull qwen3:8b

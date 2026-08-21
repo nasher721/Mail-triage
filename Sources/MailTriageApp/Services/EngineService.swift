@@ -1,6 +1,38 @@
 import Darwin
 import Foundation
 
+/// One provider binding: which AI system answers, where, as which model.
+struct ProviderBinding: Equatable {
+    var provider: AIProvider
+    var model: String
+    var baseURL: String
+    var apiKey: String
+
+    init(provider: AIProvider, model: String = "", baseURL: String = "", apiKey: String = "") {
+        self.provider = provider
+        self.model = model.isEmpty ? provider.defaultModel : model
+        self.baseURL = baseURL.isEmpty ? provider.defaultBaseURL : baseURL
+        self.apiKey = apiKey
+    }
+
+    /// The message the user needs to fix before a run can start, if any.
+    var validationFailure: String? {
+        if let failure = provider.validate(baseURL: baseURL) { return failure }
+        if model.trimmingCharacters(in: .whitespaces).isEmpty {
+            return "\(provider.title) needs a model name."
+        }
+        if provider.requiresAPIKey, apiKey.isEmpty {
+            let variable = provider.apiKeyEnvironmentVariable.map { " or set \($0)" } ?? ""
+            return "\(provider.title) needs an API key. Add it in Settings › AI Providers\(variable)."
+        }
+        return nil
+    }
+
+    var keepsDataOnThisMac: Bool {
+        provider.isLocal && EnginePaths.isLoopbackHTTPURL(baseURL)
+    }
+}
+
 struct EngineConfiguration: Equatable {
     var source: MailSource
     var runMode: RunMode
@@ -8,11 +40,35 @@ struct EngineConfiguration: Equatable {
     var useAgent: Bool
     var includeProcessed: Bool
     var inputFile: String
-    var ollamaHost: String
-    var ollamaModel: String
+    var screening: ProviderBinding
+    var agent: ProviderBinding
+    var temperature: Double?
+    var requestTimeout: Int
+    var agentMaxRounds: Int
+    var externalAIApproved: Bool
     var cdpURL: String
     var maxMessages: Int
+    var maxBodyCharacters: Int
+    var maxRetrievalPages: Int
     var outputDirectory: String
+
+    /// True when no message text leaves this Mac for either role.
+    var keepsDataOnThisMac: Bool {
+        screening.keepsDataOnThisMac && (!useAgent || agent.keepsDataOnThisMac)
+    }
+
+    /// The first configuration problem that would stop a run.
+    var validationFailure: String? {
+        if let failure = screening.validationFailure { return failure }
+        if useAgent, let failure = agent.validationFailure { return failure }
+        if !keepsDataOnThisMac, !externalAIApproved {
+            return """
+                A hosted AI provider is selected. Approve external AI in \
+                Settings › Privacy before message text is sent off this Mac.
+                """
+        }
+        return nil
+    }
 }
 
 enum EngineCommandBuilder {
@@ -55,8 +111,8 @@ enum EngineCommandBuilder {
         _ configuration: EngineConfiguration,
         operation: [String]
     ) throws -> EngineCommand {
-        guard EnginePaths.isLoopbackHTTPURL(configuration.ollamaHost) else {
-            throw EngineFailure.launchFailed("The Ollama host must be a loopback HTTP URL.")
+        if let failure = configuration.validationFailure {
+            throw EngineFailure.launchFailed(failure)
         }
         if configuration.source == .owa,
            !EnginePaths.isLoopbackHTTPURL(configuration.cdpURL) {
@@ -87,18 +143,44 @@ enum EngineCommandBuilder {
         )
     }
 
-    private static func baseEnvironment(_ configuration: EngineConfiguration) -> [String: String] {
+    static func baseEnvironment(_ configuration: EngineConfiguration) -> [String: String] {
         var environment = ProcessInfo.processInfo.environment
-        environment["TRIAGE_BACKEND"] = "ollama"
         environment["TRIAGE_SOURCE"] = configuration.source.rawValue
-        environment["OLLAMA_HOST"] = configuration.ollamaHost
-        environment["OLLAMA_MODEL"] = configuration.ollamaModel
+        environment["TRIAGE_PROVIDER"] = configuration.screening.provider.rawValue
+        environment["TRIAGE_MODEL"] = configuration.screening.model
+        environment["TRIAGE_BASE_URL"] = configuration.screening.baseURL
+        environment["TRIAGE_AGENT"] = configuration.useAgent ? "true" : "false"
+        environment["TRIAGE_AGENT_PROVIDER"] = configuration.agent.provider.rawValue
+        environment["TRIAGE_AGENT_MODEL"] = configuration.agent.model
+        environment["TRIAGE_AGENT_BASE_URL"] = configuration.agent.baseURL
+        environment["TRIAGE_AGENT_MAX_ROUNDS"] = String(configuration.agentMaxRounds)
+        environment["TRIAGE_REQUEST_TIMEOUT"] = String(configuration.requestTimeout)
+        environment["EXTERNAL_AI_APPROVED"] = configuration.externalAIApproved ? "true" : "false"
+        if let temperature = configuration.temperature {
+            environment["TRIAGE_TEMPERATURE"] = String(format: "%.2f", temperature)
+        } else {
+            environment.removeValue(forKey: "TRIAGE_TEMPERATURE")
+        }
+        // Keys are passed per role so a hosted agent never inherits the
+        // screening key, and are removed rather than blanked when absent.
+        setKey(&environment, name: "TRIAGE_API_KEY", value: configuration.screening.apiKey)
+        setKey(&environment, name: "TRIAGE_AGENT_API_KEY", value: configuration.agent.apiKey)
         environment["EDGE_CDP_URL"] = configuration.cdpURL
         environment["MAX_UNREAD_MESSAGES"] = String(configuration.maxMessages)
+        environment["MAX_BODY_CHARACTERS"] = String(configuration.maxBodyCharacters)
+        environment["MAX_RETRIEVAL_PAGES"] = String(configuration.maxRetrievalPages)
         environment["TRIAGE_OUTPUT_DIR"] = configuration.outputDirectory
         environment["EDGE_PROFILE_DIR"] = EnginePaths.edgeProfileDirectory.path
         environment["PYTHONUNBUFFERED"] = "1"
         return environment
+    }
+
+    private static func setKey(_ environment: inout [String: String], name: String, value: String) {
+        if value.isEmpty {
+            environment.removeValue(forKey: name)
+        } else {
+            environment[name] = value
+        }
     }
 }
 

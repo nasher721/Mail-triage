@@ -3,8 +3,14 @@ import json
 import unittest
 from unittest.mock import patch
 
-from email_triage.classifier import OllamaClassifier, OpenAIClassifier, resolve_ollama_model
+from email_triage.classifier import (
+    ClassificationError,
+    ProviderClassifier,
+    build_classifier,
+)
+from email_triage.config import Settings
 from email_triage.models import Route
+from email_triage.providers import build_client, provider_profile, ProviderSelection
 
 
 RESULT = {
@@ -23,13 +29,23 @@ RESULT = {
 }
 
 
+def classifier_for(provider: str, **overrides) -> ProviderClassifier:
+    profile = provider_profile(provider)
+    selection = ProviderSelection(
+        profile=profile,
+        base_url=overrides.get("base_url", profile.default_base_url),
+        model=overrides.get("model", profile.default_model),
+        api_key="synthetic-key" if profile.requires_api_key else "",
+    )
+    return ProviderClassifier(build_client(selection))
+
+
 class ClassifierTests(unittest.TestCase):
-    def test_rest_request_uses_strict_schema_and_body_only_payload(self):
+    def test_openai_request_uses_strict_schema_and_body_only_payload(self):
         captured = {}
 
-        def fake_urlopen(request, timeout):
+        def fake_urlopen(request, timeout=None):
             captured["request"] = request
-            captured["timeout"] = timeout
             response = {
                 "output": [
                     {
@@ -40,10 +56,8 @@ class ClassifierTests(unittest.TestCase):
             }
             return io.BytesIO(json.dumps(response).encode())
 
-        with patch("email_triage.classifier.urlopen", fake_urlopen):
-            result = OpenAIClassifier("synthetic-key", "gpt-4o").classify(
-                "Can we meet next Tuesday?", True
-            )
+        with patch("email_triage.providers.urlopen", fake_urlopen):
+            result = classifier_for("openai").classify("Can we meet next Tuesday?", True)
 
         request_payload = json.loads(captured["request"].data)
         model_input = json.loads(request_payload["input"])
@@ -56,37 +70,59 @@ class ClassifierTests(unittest.TestCase):
     def test_ollama_request_stays_on_local_host_and_disables_thinking(self):
         captured = {}
 
-        def fake_urlopen(request, timeout):
+        def fake_urlopen(request, timeout=None):
             captured["url"] = request.full_url
             captured["payload"] = json.loads(request.data)
-            captured["timeout"] = timeout
-            response = {"message": {"content": json.dumps(RESULT)}}
-            return io.BytesIO(json.dumps(response).encode())
+            return io.BytesIO(json.dumps({"message": {"content": json.dumps(RESULT)}}).encode())
 
-        with patch("email_triage.classifier.urlopen", fake_urlopen):
-            result = OllamaClassifier("http://127.0.0.1:11434", "qwen3:8b").classify(
-                "Can we meet next Tuesday?", True
-            )
+        with patch("email_triage.providers.urlopen", fake_urlopen):
+            result = classifier_for("ollama").classify("Can we meet next Tuesday?", True)
 
         self.assertEqual(captured["url"], "http://127.0.0.1:11434/api/chat")
         self.assertFalse(captured["payload"]["think"])
         self.assertEqual(captured["payload"]["format"]["type"], "object")
         self.assertEqual(result.route, Route.NEEDS_REPLY)
 
-    def test_resolve_ollama_model_prefers_strongest_installed_tag(self):
-        def fake_urlopen(request, timeout=None):
-            response = {"models": [{"name": "qwen3:0.6b"}, {"name": "qwen3:8b"}]}
-            return io.BytesIO(json.dumps(response).encode())
+    def test_every_provider_produces_the_same_screening_contract(self):
+        responses = {
+            "ollama": {"message": {"content": json.dumps(RESULT)}},
+            "anthropic": {"content": [{"type": "tool_use", "input": RESULT}]},
+            "openrouter": {"choices": [{"message": {"content": json.dumps(RESULT)}}]},
+            "gemini": {"choices": [{"message": {"content": json.dumps(RESULT)}}]},
+        }
+        for provider, response in responses.items():
+            with self.subTest(provider=provider):
+                with patch(
+                    "email_triage.providers.urlopen",
+                    lambda request, timeout=None, response=response: io.BytesIO(
+                        json.dumps(response).encode()
+                    ),
+                ):
+                    result = classifier_for(provider).classify("Can we meet?", False)
+                self.assertEqual(result.route, Route.NEEDS_REPLY)
+                self.assertEqual(result.priority_score, 3)
 
-        with patch("email_triage.classifier.urlopen", fake_urlopen):
-            self.assertEqual(
-                resolve_ollama_model("http://127.0.0.1:11434", "qwen3:8b"),
-                "qwen3:8b",
-            )
-            self.assertEqual(
-                resolve_ollama_model("http://127.0.0.1:11434", "missing:model"),
-                "qwen3:8b",
-            )
+    def test_transport_failures_surface_as_classification_errors(self):
+        with patch("email_triage.providers.urlopen", side_effect=TimeoutError):
+            with self.assertRaises(ClassificationError):
+                classifier_for("ollama").classify("Can we meet?", False)
+
+    def test_build_classifier_pins_an_installed_local_model(self):
+        environment = {
+            "TRIAGE_PROVIDER": "ollama",
+            "OLLAMA_MODEL": "missing:model",
+            "TRIAGE_INPUT": "samples/inbox.jsonl",
+        }
+        listing = {"models": [{"name": "qwen3:8b"}]}
+        with patch.dict("os.environ", environment, clear=True):
+            settings = Settings.from_env()
+        with patch(
+            "email_triage.providers.urlopen",
+            lambda request, timeout=None: io.BytesIO(json.dumps(listing).encode()),
+        ):
+            classifier = build_classifier(settings)
+        self.assertEqual(classifier.model, "qwen3:8b")
+        self.assertEqual(classifier.provider, "ollama")
 
 
 if __name__ == "__main__":
