@@ -12,11 +12,12 @@ from email_triage.accessibility import (
     OutlookAccessibilityMailbox,
     accessibility_diagnostic,
 )
-from email_triage.agent import DeterministicSortingAgent, OllamaSortingAgent
+from email_triage.agent import DeterministicSortingAgent, SortingAgent, build_agent
 from email_triage.apply import ActionLog, DryRunActuator, GraphActuator, apply_plan
 from email_triage.backends import backend_capabilities
-from email_triage.classifier import _list_ollama_models, build_classifier, resolve_ollama_model
+from email_triage.classifier import build_classifier
 from email_triage.config import ConfigurationError, Settings
+from email_triage.providers import PROVIDER_NAMES, describe_providers
 from email_triage.desktop import OutlookDesktopMailbox, desktop_diagnostic
 from email_triage.graph import GraphError, GraphMailbox
 from email_triage.local_mailbox import LocalMailbox
@@ -50,6 +51,42 @@ def build_parser() -> argparse.ArgumentParser:
         "--source",
         choices=("graph", "local", "owa", "desktop", "accessibility"),
         help="Mailbox source. --owa is the same as --source owa.",
+    )
+    parser.add_argument(
+        "--provider",
+        choices=PROVIDER_NAMES,
+        help=(
+            "AI system used for screening: ollama (default, local), openai, anthropic, "
+            "openrouter, opencode, lmstudio, gemini, groq, and more. Overrides TRIAGE_PROVIDER."
+        ),
+    )
+    parser.add_argument(
+        "--model",
+        help="Model id for the screening provider. Overrides TRIAGE_MODEL.",
+    )
+    parser.add_argument(
+        "--base-url",
+        help=(
+            "Base URL for the screening provider. Needed for self-hosted gateways, "
+            "Azure OpenAI deployments, and --provider custom."
+        ),
+    )
+    parser.add_argument(
+        "--agent-provider",
+        choices=PROVIDER_NAMES,
+        help="Run the sorting agent on a different AI system than screening.",
+    )
+    parser.add_argument(
+        "--agent-model",
+        help="Model id for the sorting agent when it differs from the screening model.",
+    )
+    parser.add_argument(
+        "--list-providers",
+        action="store_true",
+        help=(
+            "Print the supported AI systems with their default endpoints and key "
+            "variables as JSON, then exit. Nothing is contacted."
+        ),
     )
     parser.add_argument(
         "--diagnose",
@@ -134,6 +171,35 @@ def _cli_source(args: argparse.Namespace) -> str | None:
     return args.source
 
 
+def _ai_report(args: argparse.Namespace) -> dict[str, object]:
+    """Describe the selected AI systems without contacting them."""
+
+    requested = args.provider or os.getenv("TRIAGE_PROVIDER", "") or os.getenv(
+        "TRIAGE_BACKEND", ""
+    ) or "ollama"
+    try:
+        settings = Settings.from_env(
+            input_path=args.input,
+            use_agent=False if args.no_agent else None,
+            source=_cli_source(args),
+            provider=args.provider,
+            model=args.model,
+            base_url=args.base_url,
+            agent_provider=args.agent_provider,
+            agent_model=args.agent_model,
+        )
+    except ConfigurationError as exc:
+        return {"configured": False, "provider": requested.strip().lower(), "detail": str(exc)}
+    return {
+        "configured": True,
+        "screening": settings.screening.to_dict(),
+        "sorting_agent": (
+            settings.agent.to_dict() if settings.use_agent else {"provider": "none"}
+        ),
+        "keeps_data_local": settings.uses_local_inference,
+    }
+
+
 def _diagnostic_report(args: argparse.Namespace) -> dict[str, object]:
     """Check backend readiness without reading mail, tokens, or model state."""
 
@@ -147,7 +213,10 @@ def _diagnostic_report(args: argparse.Namespace) -> dict[str, object]:
         raise ConfigurationError(
             "TRIAGE_SOURCE must be graph, local, owa, desktop, or accessibility"
         )
-    report: dict[str, object] = {"capabilities": backend_capabilities(source).to_dict()}
+    report: dict[str, object] = {
+        "capabilities": backend_capabilities(source).to_dict(),
+        "ai": _ai_report(args),
+    }
     if source == "owa":
         cdp_url = (
             os.getenv("EDGE_CDP_URL", "").strip()
@@ -204,6 +273,11 @@ def run(args: argparse.Namespace) -> int:
         mark_read=args.mark_read or None,
         use_agent=False if args.no_agent else None,
         source=_cli_source(args),
+        provider=args.provider,
+        model=args.model,
+        base_url=args.base_url,
+        agent_provider=args.agent_provider,
+        agent_model=args.agent_model,
     )
 
     if args.login:
@@ -267,28 +341,30 @@ def run(args: argparse.Namespace) -> int:
         mailbox_source = live_mailbox
 
     classifier = build_classifier(settings)
-    if settings.ai_backend == "ollama":
-        if not _list_ollama_models(settings.ollama_host):
-            raise ConfigurationError(
-                f"Ollama is unavailable at {settings.ollama_host} or has no models. "
-                "Start it with `ollama serve` and run `ollama pull qwen3:8b` "
-                "(best fit for 18GB Apple Silicon)."
-            )
-        location = "this machine" if settings.uses_local_inference else settings.ollama_host
+    ready, detail = classifier.client.reachable()
+    if not ready:
+        raise ConfigurationError(detail)
+    location = (
+        "this machine"
+        if settings.screening.keeps_data_local
+        else settings.screening.base_url
+    )
+    print(
+        f"Screening with {classifier.client.profile.label} model {classifier.model} "
+        f"at {location}.",
+        file=sys.stderr,
+    )
+
+    agent: SortingAgent | DeterministicSortingAgent = build_agent(settings)
+    if isinstance(agent, SortingAgent):
+        agent_location = (
+            "this machine" if settings.agent.keeps_data_local else settings.agent.base_url
+        )
         print(
-            f"Using Ollama model {classifier.model} at {location}. "
-            "Email bodies are not sent to OpenAI.",
+            f"Sorting agent: {agent.client.profile.label} model {agent.model} "
+            f"at {agent_location}. The agent never sees message bodies.",
             file=sys.stderr,
         )
-
-    agent: OllamaSortingAgent | DeterministicSortingAgent
-    if settings.use_agent:
-        agent = OllamaSortingAgent(
-            settings.ollama_host,
-            resolve_ollama_model(settings.ollama_host, settings.ollama_model),
-        )
-    else:
-        agent = DeterministicSortingAgent()
 
     actuator: GraphActuator | DryRunActuator
     if settings.apply_changes and live_mailbox is not None:
@@ -365,6 +441,9 @@ def main(argv: list[str] | None = None) -> int:
                 "Ignoring --input; --owa reads the live Outlook tab in Edge.",
                 file=sys.stderr,
             )
+        if args.list_providers:
+            print(json.dumps(describe_providers(), indent=2, sort_keys=True))
+            return 0
         if args.diagnose and args.live_probe:
             raise ConfigurationError("--diagnose and --live-probe are mutually exclusive")
         if args.diagnose:
@@ -399,6 +478,11 @@ def main(argv: list[str] | None = None) -> int:
             mark_read=args.mark_read or None,
             use_agent=False if args.no_agent else None,
             source=_cli_source(args),
+            provider=args.provider,
+            model=args.model,
+            base_url=args.base_url,
+            agent_provider=args.agent_provider,
+            agent_model=args.agent_model,
         )
         while True:
             try:

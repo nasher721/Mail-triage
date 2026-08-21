@@ -17,7 +17,7 @@ struct OverviewView: View {
         .navigationTitle("Overview")
         .task {
             if store.diagnostic == nil { store.runDiagnostic() }
-            store.checkOllama()
+            store.checkSelectedProviders()
         }
     }
 
@@ -31,7 +31,7 @@ struct OverviewView: View {
             VStack(alignment: .leading, spacing: 6) {
                 Text("Local-first Outlook triage")
                     .font(.largeTitle.bold())
-                Text("Screen unread mail with your signed-in Edge session and local Ollama model—no Microsoft Graph registration required.")
+                Text("Screen unread mail with your signed-in Edge session and the AI system of your choice—local Ollama, Claude, ChatGPT, OpenRouter, and more. No Microsoft Graph registration required.")
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -59,12 +59,12 @@ struct OverviewView: View {
             )
 
             StatusCard(
-                title: "Local AI",
-                detail: store.ollamaStatusDetail,
-                symbol: "brain.head.profile",
-                state: ollamaState,
-                actionTitle: store.ollamaAvailable == false ? "Open Ollama" : "Check Again",
-                action: store.ollamaAvailable == false ? store.startOllama : store.checkOllama
+                title: aiTitle,
+                detail: store.status(for: store.screeningProvider).detail,
+                symbol: store.screeningProvider.symbol,
+                state: aiState,
+                actionTitle: aiActionTitle,
+                action: aiAction
             )
 
             StatusCard(
@@ -113,8 +113,16 @@ struct OverviewView: View {
                     Button("Run Diagnostics") { store.runDiagnostic() }
                     Button("Redacted Live Probe") { store.runLiveProbe() }
                         .disabled(store.source == .local)
+                    Button("Choose AI Provider") { store.selection = .providers }
                     Spacer()
                     Button("Open Output Folder") { store.revealOutputDirectory() }
+                }
+
+                if let reason = store.runBlockedReason {
+                    Label(reason, systemImage: "exclamationmark.triangle")
+                        .font(.callout)
+                        .foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
             .padding(6)
@@ -133,13 +141,20 @@ struct OverviewView: View {
                 VStack(alignment: .leading, spacing: 5) {
                     Text("Safety boundaries stay enforced")
                         .font(.headline)
-                    Text("Mail Triage keeps captured bearer and cookie values in memory; Edge persists login state in its owner-only Application Support profile. Mail Triage cannot send, forward, delete, or download attachment content. Clinical and suspicious content is routed to manual review.")
+                    Text(privacyDetail)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
             .padding(6)
         }
+    }
+
+    private var privacyDetail: String {
+        let base = "Mail Triage keeps captured bearer and cookie values in memory; Edge persists login state in its owner-only Application Support profile. Mail Triage cannot send, forward, delete, or download attachment content. Clinical and suspicious content is routed to manual review."
+        return store.keepsDataOnThisMac
+            ? base + " Screening and filing both run on this Mac."
+            : base + " A hosted AI provider is selected, so message text leaves this Mac for screening."
     }
 
     private var outlookReady: Bool { store.diagnostic?.readiness.available == true }
@@ -154,12 +169,29 @@ struct OverviewView: View {
         guard let probe = store.liveProbe else { return .neutral }
         return probe.available ? .ready : .warning
     }
-    private var ollamaState: StatusCard.State {
-        switch store.ollamaAvailable {
-        case true: .ready
-        case false: .warning
-        case nil: .neutral
+    private var aiTitle: String {
+        store.useAgent && store.useSeparateAgentProvider
+            ? "\(store.screeningProvider.title) + \(store.agentProvider.title)"
+            : store.screeningProvider.title
+    }
+
+    private var aiState: StatusCard.State {
+        switch store.status(for: store.screeningProvider) {
+        case .ready: .ready
+        case .needsAttention: .warning
+        case .checking, .unknown: .neutral
         }
+    }
+
+    private var needsOllama: Bool {
+        store.screeningProvider == .ollama
+            && !store.status(for: .ollama).isReady
+    }
+
+    private var aiActionTitle: String { needsOllama ? "Open Ollama" : "Check Again" }
+
+    private var aiAction: () -> Void {
+        needsOllama ? store.startOllama : store.checkSelectedProviders
     }
 }
 

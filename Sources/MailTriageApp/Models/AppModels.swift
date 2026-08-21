@@ -2,6 +2,7 @@ import Foundation
 
 enum SidebarDestination: String, CaseIterable, Identifiable {
     case overview
+    case providers
     case results
     case activity
 
@@ -10,6 +11,7 @@ enum SidebarDestination: String, CaseIterable, Identifiable {
     var title: String {
         switch self {
         case .overview: "Overview"
+        case .providers: "AI Providers"
         case .results: "Triage Results"
         case .activity: "Activity"
         }
@@ -18,6 +20,7 @@ enum SidebarDestination: String, CaseIterable, Identifiable {
     var systemImage: String {
         switch self {
         case .overview: "rectangle.grid.2x2"
+        case .providers: "cpu"
         case .results: "tray.full"
         case .activity: "text.alignleft"
         }

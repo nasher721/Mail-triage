@@ -20,11 +20,24 @@ struct ResultsView: View {
                 }
             } else {
                 HSplitView {
-                    List(store.results, selection: $store.selectedResultID) { record in
-                        ResultRow(record: record)
-                            .tag(record.id)
+                    VStack(spacing: 0) {
+                        filterBar
+                        Divider()
+                        List(store.filteredResults, selection: $store.selectedResultID) { record in
+                            ResultRow(record: record)
+                                .tag(record.id)
+                        }
+                        .overlay {
+                            if store.filteredResults.isEmpty {
+                                ContentUnavailableView(
+                                    "No Matching Results",
+                                    systemImage: "line.3.horizontal.decrease.circle",
+                                    description: Text("Change the filter or search text.")
+                                )
+                            }
+                        }
                     }
-                    .frame(minWidth: 300, idealWidth: 360)
+                    .frame(minWidth: 300, idealWidth: 380)
 
                     if let record = selectedRecord {
                         ResultDetailView(record: record)
@@ -35,11 +48,69 @@ struct ResultsView: View {
                     }
                 }
                 .onAppear {
-                    store.selectedResultID = store.selectedResultID ?? store.results.first?.id
+                    store.selectedResultID = store.selectedResultID ?? store.filteredResults.first?.id
                 }
             }
         }
         .navigationTitle("Triage Results")
+        .toolbar {
+            ToolbarItemGroup(placement: .secondaryAction) {
+                Button {
+                    store.exportResults(asCSV: false)
+                } label: {
+                    Label("Export JSON", systemImage: "square.and.arrow.up")
+                }
+                .disabled(store.results.isEmpty)
+
+                Button {
+                    store.exportResults(asCSV: true)
+                } label: {
+                    Label("Export CSV", systemImage: "tablecells")
+                }
+                .disabled(store.results.isEmpty)
+            }
+        }
+    }
+
+    /// Local filtering only: nothing is re-screened and no body text is shown.
+    private var filterBar: some View {
+        VStack(spacing: 8) {
+            Picker("Route", selection: $store.routeFilter) {
+                ForEach(RouteFilter.allCases) { filter in
+                    Text(filter.title).tag(filter)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                TextField("Search subject, sender, or summary", text: $store.resultSearch)
+                    .textFieldStyle(.plain)
+                if !store.resultSearch.isEmpty {
+                    Button {
+                        store.resultSearch = ""
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                }
+            }
+
+            HStack {
+                Text("\(store.filteredResults.count) of \(store.results.count) message\(store.results.count == 1 ? "" : "s")")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if let date = store.lastRunDate {
+                    Text("Run \(date.formatted(date: .omitted, time: .shortened))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .padding(10)
     }
 
     private var selectedRecord: TriageRecord? {

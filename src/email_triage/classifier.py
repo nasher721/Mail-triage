@@ -1,12 +1,22 @@
+"""Screening: one structured, schema-checked verdict per email body.
+
+The transport lives in :mod:`email_triage.providers`, so the same instructions
+and JSON schema are used whichever AI system the operator selects.
+"""
+
 from __future__ import annotations
 
 import json
 from typing import Any
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
 
 from email_triage.config import Settings
 from email_triage.models import ScreeningResult
+from email_triage.providers import (
+    ProviderClient,
+    ProviderError,
+    build_client,
+    resolve_model,
+)
 
 PREFERRED_OLLAMA_MODELS = (
     "qwen3:14b",
@@ -16,6 +26,8 @@ PREFERRED_OLLAMA_MODELS = (
     "qwen3:4b",
     "qwen3:0.6b",
 )
+
+SCREENING_SCHEMA_NAME = "email_screening"
 
 
 SYSTEM_INSTRUCTIONS = """You screen an incoming email body for a review-only Outlook workflow.
@@ -93,167 +105,48 @@ class ClassificationError(RuntimeError):
     """Raised when the model cannot produce a valid screening contract."""
 
 
-class OpenAIClassifier:
-    def __init__(self, api_key: str, model: str):
-        self.api_key = api_key
-        self.model = model
+class ProviderClassifier:
+    """Screen one email body through the selected provider."""
+
+    def __init__(self, client: ProviderClient):
+        self.client = client
+
+    @property
+    def model(self) -> str:
+        return self.client.model
+
+    @property
+    def provider(self) -> str:
+        return self.client.profile.name
 
     def classify(self, body: str, has_attachments: bool) -> ScreeningResult:
-        payload = {
-            "model": self.model,
-            "store": False,
-            "instructions": SYSTEM_INSTRUCTIONS,
-            "input": json.dumps(
-                {"email_body": body, "has_attachments": has_attachments},
-                ensure_ascii=False,
-            ),
-            "text": {
-                "format": {
-                    "type": "json_schema",
-                    "name": "email_screening",
-                    "strict": True,
-                    "schema": SCREENING_JSON_SCHEMA,
-                }
-            },
-        }
-        request = Request(
-            "https://api.openai.com/v1/responses",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
+        payload = json.dumps(
+            {"email_body": body, "has_attachments": has_attachments},
+            ensure_ascii=False,
         )
         try:
-            with urlopen(request, timeout=60) as response:
-                raw_response = json.load(response)
-        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as exc:
-            raise ClassificationError("OpenAI screening request failed") from exc
+            raw = self.client.complete_json(
+                SYSTEM_INSTRUCTIONS, payload, SCREENING_JSON_SCHEMA, SCREENING_SCHEMA_NAME
+            )
+        except ProviderError as exc:
+            raise ClassificationError(str(exc)) from exc
         try:
-            output_text = _extract_output_text(raw_response)
-            return ScreeningResult.from_dict(json.loads(output_text))
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise ClassificationError("OpenAI returned an invalid screening result") from exc
-
-
-class OllamaClassifier:
-    """Screen mail with a local Ollama model. Bodies are posted only to the configured host."""
-
-    def __init__(self, host: str, model: str):
-        self.host = host.rstrip("/")
-        self.model = model
-
-    def classify(self, body: str, has_attachments: bool) -> ScreeningResult:
-        payload = {
-            "model": self.model,
-            "stream": False,
-            "think": False,
-            "format": SCREENING_JSON_SCHEMA,
-            "messages": [
-                {"role": "system", "content": SYSTEM_INSTRUCTIONS},
-                {
-                    "role": "user",
-                    "content": json.dumps(
-                        {"email_body": body, "has_attachments": has_attachments},
-                        ensure_ascii=False,
-                    ),
-                },
-            ],
-        }
-        request = Request(
-            f"{self.host}/api/chat",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        try:
-            with urlopen(request, timeout=180) as response:
-                raw_response = json.load(response)
-        except HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            if exc.code == 404:
-                raise ClassificationError(
-                    f"Ollama model {self.model!r} is not installed. Run: ollama pull {self.model}"
-                ) from exc
-            raise ClassificationError(f"Ollama screening request failed: {detail}") from exc
-        except (URLError, TimeoutError, json.JSONDecodeError) as exc:
+            return ScreeningResult.from_dict(raw)
+        except (KeyError, TypeError, ValueError) as exc:
             raise ClassificationError(
-                f"Ollama is unavailable at {self.host}. Start it with `ollama serve`, "
-                f"then install a model with `ollama pull {self.model}`."
+                f"{self.client.profile.label} returned an invalid screening result"
             ) from exc
-        try:
-            content = raw_response.get("message", {}).get("content")
-            return ScreeningResult.from_dict(_parse_json_object(content))
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise ClassificationError("Ollama returned an invalid screening result") from exc
 
 
-def _extract_output_text(response: dict[str, Any]) -> str:
-    for item in response.get("output", []):
-        if item.get("type") != "message":
-            continue
-        for content in item.get("content", []):
-            if content.get("type") == "output_text" and isinstance(content.get("text"), str):
-                return content["text"]
-            if content.get("type") == "refusal":
-                raise ValueError("model refused the screening request")
-    raise ValueError("response did not contain output_text")
+def build_screening_client(settings: Settings) -> ProviderClient:
+    """Build the screening transport, pinning a locally installed model when needed."""
+
+    client = build_client(settings.screening)
+    resolved = resolve_model(client, settings.screening.model, PREFERRED_OLLAMA_MODELS)
+    if resolved != client.model:
+        client.model = resolved
+    return client
 
 
-def _parse_json_object(text: Any) -> dict[str, Any]:
-    if not isinstance(text, str) or not text.strip():
-        raise ValueError("empty model output")
-    stripped = text.strip()
-    try:
-        value = json.loads(stripped)
-    except json.JSONDecodeError:
-        start = stripped.find("{")
-        end = stripped.rfind("}")
-        if start == -1 or end <= start:
-            raise
-        value = json.loads(stripped[start : end + 1])
-    if not isinstance(value, dict):
-        raise ValueError("model output is not a JSON object")
-    return value
-
-
-def _list_ollama_models(host: str) -> list[str]:
-    request = Request(f"{host.rstrip('/')}/api/tags", method="GET")
-    try:
-        with urlopen(request, timeout=5) as response:
-            payload = json.load(response)
-    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
-        return []
-    names: list[str] = []
-    for item in payload.get("models", []):
-        name = item.get("name")
-        if isinstance(name, str) and name:
-            names.append(name)
-    return names
-
-
-def resolve_ollama_model(host: str, requested: str) -> str:
-    """Use the requested model when installed; otherwise pick the strongest local tag."""
-
-    installed = _list_ollama_models(host)
-    installed_set = set(installed)
-    if requested in installed_set:
-        return requested
-    for name in PREFERRED_OLLAMA_MODELS:
-        if name in installed_set:
-            return name
-    requested_base = requested.split(":")[0]
-    for name in installed:
-        if name.split(":")[0] == requested_base:
-            return name
-    if installed:
-        return installed[0]
-    return requested
-
-
-def build_classifier(settings: Settings) -> OpenAIClassifier | OllamaClassifier:
-    if settings.ai_backend == "ollama":
-        model = resolve_ollama_model(settings.ollama_host, settings.ollama_model)
-        return OllamaClassifier(settings.ollama_host, model)
-    return OpenAIClassifier(settings.openai_api_key, settings.openai_model)
+def build_classifier(settings: Settings) -> ProviderClassifier:
+    return ProviderClassifier(build_screening_client(settings))

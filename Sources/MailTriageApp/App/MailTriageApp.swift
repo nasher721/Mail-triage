@@ -52,9 +52,43 @@ struct MailTriageApp: App {
                 .keyboardShortcut("r", modifiers: [.command])
                 .disabled(!store.canRun)
 
+                Button("Apply Changes to Outlook…") {
+                    store.runMode = .apply
+                    store.requestRun()
+                }
+                .keyboardShortcut("r", modifiers: [.command, .shift])
+                .disabled(!store.canRun || !store.source.supportsApply)
+
                 Button("Run Diagnostics") { store.runDiagnostic() }
                     .keyboardShortcut("d", modifiers: [.command, .shift])
                     .disabled(store.isRunning)
+
+                Divider()
+
+                Menu("AI Provider") {
+                    ForEach(AIProvider.allCases) { provider in
+                        Button {
+                            store.selectScreeningProvider(provider)
+                        } label: {
+                            Text(provider == store.screeningProvider ? "\(provider.title) ✓" : provider.title)
+                        }
+                    }
+                }
+
+                Button("Check AI Provider") { store.checkSelectedProviders() }
+                    .disabled(store.isRunning)
+
+                Toggle("Run Previews Automatically", isOn: Binding(
+                    get: { store.automationEnabled },
+                    set: { store.setAutomation(enabled: $0) }
+                ))
+
+                Divider()
+
+                Button("Export Results as JSON…") { store.exportResults(asCSV: false) }
+                    .disabled(store.results.isEmpty)
+                Button("Export Results as CSV…") { store.exportResults(asCSV: true) }
+                    .disabled(store.results.isEmpty)
 
                 Divider()
 
