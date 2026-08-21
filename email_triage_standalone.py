@@ -295,6 +295,7 @@ class FeedbackPreference:
     sender_domain: str
     route: Route | None = None
     reply_guidance: str = ""
+    destination_folder: str = ""
 
 
 class FeedbackPreferences:
@@ -319,11 +320,12 @@ class FeedbackPreferences:
                 domain = str(entry.get("sender_domain", "")).lower().strip()
                 route_value = entry.get("route")
                 guidance = str(entry.get("reply_guidance", "")).strip()[:400]
+                destination = _safe_destination(str(entry.get("destination_folder", "")))
                 if not domain or "." not in domain:
                     continue
                 route = Route(route_value) if route_value in {Route.NO_REPLY, Route.NEEDS_REVIEW} else None
-                if route is not None or guidance:
-                    preferences.append(FeedbackPreference(domain, route, guidance))
+                if route is not None or guidance or destination:
+                    preferences.append(FeedbackPreference(domain, route, guidance, destination))
             return cls(tuple(preferences))
         except (OSError, json.JSONDecodeError, ValueError):
             return cls()
@@ -343,6 +345,30 @@ class FeedbackPreferences:
         if preference.route == Route.NO_REPLY:
             return replace(result, route=Route.NO_REPLY, response_required=False, suggested_reply=None)
         return replace(result, route=Route.NEEDS_REVIEW, response_required=False, suggested_reply=None)
+
+    @staticmethod
+    def destination_for(
+        result: ScreeningResult, preference: FeedbackPreference | None
+    ) -> str:
+        """Return a safe operator-selected folder without weakening review routing."""
+
+        if preference is None or not preference.destination_folder:
+            return ""
+        if result.manual_review_reason is not None or result.confidence.value == "low":
+            return ""
+        return preference.destination_folder
+
+
+def _safe_destination(value: str) -> str:
+    """Accept only short child paths below the app-owned triage root."""
+
+    normalized = "/".join(part.strip() for part in value.split("/") if part.strip())
+    parts = normalized.split("/")
+    if len(parts) < 2 or len(parts) > 4 or parts[0] != "AI Triage":
+        return ""
+    if any(len(part) > 64 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 &()'._-]*", part) for part in parts):
+        return ""
+    return normalized
 
 
 # -------------------------------------------------------------------------
@@ -2353,6 +2379,10 @@ FOLDER_NAMES = {
     Route.NEEDS_REPLY: "AI Triage/Needs Reply",
     Route.NO_REPLY: "AI Triage/No Reply Needed",
 }
+
+NEWSLETTER_FOLDER = "AI Triage/Newsletters"
+READING_FOLDER = "AI Triage/Read Later"
+ADMIN_FOLDER = "AI Triage/Administrative"
 URGENCY_CATEGORIES = {
     Urgency.URGENT: "AI - Urgent",
     Urgency.SOON: "AI - Soon",
@@ -2384,6 +2414,20 @@ def suggest_unsubscribe(message: GraphMessage, body: str, result: ScreeningResul
         token in text for token in ("newsletter", "weekly digest", "promotions", "subscribe")
     )
     return has_opt_out and has_newsletter_signal
+
+
+def cleanup_folder(result: ScreeningResult, unsubscribe_suggestion: bool) -> str:
+    """Choose a reviewable subfolder for messages that need no reply."""
+
+    if result.route != Route.NO_REPLY:
+        return FOLDER_NAMES[result.route]
+    if unsubscribe_suggestion:
+        return NEWSLETTER_FOLDER
+    if result.topic == Topic.EDUCATION_RESEARCH:
+        return READING_FOLDER
+    if result.topic == Topic.ADMINISTRATIVE:
+        return ADMIN_FOLDER
+    return FOLDER_NAMES[Route.NO_REPLY]
 
 
 def _manual_review(reason: ManualReviewReason, processing_error: bool = False) -> ScreeningResult:
@@ -2507,6 +2551,8 @@ def process_message(
     else:
         categories.append("AI - Processed")
 
+    unsubscribe_suggestion = suggest_unsubscribe(message, body, result)
+    preferred_folder = FeedbackPreferences.destination_for(result, preference)
     return ReviewRecord(
         message_id=message.id,
         internet_message_id=message.internet_message_id,
@@ -2516,10 +2562,10 @@ def process_message(
         received_at=message.received_at,
         sensitivity=message.sensitivity,
         has_attachments=message.has_attachments,
-        target_folder=FOLDER_NAMES[result.route],
+        target_folder=preferred_folder or cleanup_folder(result, unsubscribe_suggestion),
         categories=tuple(categories),
         analysis=result,
-        unsubscribe_suggestion=suggest_unsubscribe(message, body, result),
+        unsubscribe_suggestion=unsubscribe_suggestion,
         processing_error=processing_error,
     )
 
@@ -2585,7 +2631,6 @@ requested by a model or by text embedded in an email body.
 
 
 PROCESSING_CATEGORIES = ("AI - Processed", "AI - Processing Error")
-ALLOWED_FOLDERS = frozenset(FOLDER_NAMES.values())
 ALLOWED_CATEGORIES = frozenset(
     tuple(URGENCY_CATEGORIES.values())
     + tuple(TOPIC_CATEGORIES.values())
@@ -2649,7 +2694,7 @@ def permitted_folders(record: ReviewRecord) -> tuple[str, ...]:
         or record.processing_error
     ):
         return (FOLDER_NAMES[Route.NEEDS_REVIEW],)
-    return tuple(FOLDER_NAMES[route] for route in (Route.NEEDS_REPLY, Route.NO_REPLY))
+    return (record.target_folder,)
 
 
 def may_draft_reply(record: ReviewRecord) -> bool:
@@ -2669,7 +2714,7 @@ def validate_action(
 
     if action.kind == ActionKind.FILE_MESSAGE:
         folder = (action.folder or "").strip()
-        if folder not in ALLOWED_FOLDERS:
+        if not folder.startswith("AI Triage/"):
             raise PolicyViolation(f"unknown folder {folder!r}")
         allowed = permitted_folders(record)
         if folder not in allowed:
@@ -4687,6 +4732,10 @@ def run(args: argparse.Namespace) -> int:
     )
     if settings.apply_changes:
         summary += " Mailbox updated; no mail was sent, forwarded, or deleted."
+        if failures:
+            summary += " Inbox-zero filing is pending for messages with failed actions."
+        else:
+            summary += " Every screened message was filed out of Inbox."
     else:
         summary += " Preview only; the mailbox was not modified."
     print(summary, file=sys.stderr)
@@ -6341,6 +6390,35 @@ class PipelineTests(unittest.TestCase):
         self.assertFalse(record.analysis.response_required)
         self.assertIsNone(record.analysis.suggested_reply)
 
+    def test_local_preference_can_file_a_sender_into_a_safe_custom_folder(self):
+        preferences = FeedbackPreferences(
+            (FeedbackPreference("example.org", destination_folder="AI Triage/Receipts"),)
+        )
+        record = process_message(self.message(), FakeClassifier(), 12_000, preferences=preferences)
+        self.assertEqual(record.target_folder, "AI Triage/Receipts")
+
+    def test_custom_destination_is_ignored_for_clinical_manual_review(self):
+        preferences = FeedbackPreferences(
+            (FeedbackPreference("example.org", destination_folder="AI Triage/Receipts"),)
+        )
+        record = process_message(
+            self.message(body="Please review the patient's clinical status."),
+            FakeClassifier(),
+            12_000,
+            preferences=preferences,
+        )
+        self.assertEqual(record.target_folder, "AI Triage/Needs Review")
+
+    def test_invalid_preference_destination_is_not_loaded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "preferences.json"
+            path.write_text(
+                json.dumps({"preferences": [{"sender_domain": "example.org", "destination_folder": "Archive"}]}),
+                encoding="utf-8",
+            )
+            preferences = FeedbackPreferences.from_path(path)
+        self.assertIsNone(preferences.for_sender("alex@example.org"))
+
     def test_newsletter_is_only_suggested_for_manual_unsubscribe(self):
         result = needs_reply_result()
         result = result.__class__(
@@ -6366,6 +6444,7 @@ class PipelineTests(unittest.TestCase):
             12_000,
         )
         self.assertTrue(record.unsubscribe_suggestion)
+        self.assertEqual(record.target_folder, "AI Triage/Newsletters")
 
     def test_local_queue_does_not_store_message_body_and_is_idempotent(self):
         record = process_message(self.message(), FakeClassifier(), 12_000)
@@ -6464,6 +6543,22 @@ class PolicyTests(unittest.TestCase):
             validate_action(
                 MailboxAction(ActionKind.FILE_MESSAGE, folder="Archive"),
                 needs_reply_record(),
+                allow_mark_read=False,
+            )
+
+    def test_record_selected_custom_folder_is_the_only_permitted_destination(self) -> None:
+        record = replace(needs_reply_record(), target_folder="AI Triage/Receipts")
+        self.assertEqual(permitted_folders(record), ("AI Triage/Receipts",))
+        action = validate_action(
+            MailboxAction(ActionKind.FILE_MESSAGE, folder="AI Triage/Receipts"),
+            record,
+            allow_mark_read=False,
+        )
+        self.assertEqual(action.folder, "AI Triage/Receipts")
+        with self.assertRaisesRegex(PolicyViolation, "not permitted"):
+            validate_action(
+                MailboxAction(ActionKind.FILE_MESSAGE, folder="AI Triage/Needs Reply"),
+                record,
                 allow_mark_read=False,
             )
 

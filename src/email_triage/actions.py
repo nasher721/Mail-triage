@@ -21,7 +21,6 @@ from email_triage.pipeline import (
 
 
 PROCESSING_CATEGORIES = ("AI - Processed", "AI - Processing Error")
-ALLOWED_FOLDERS = frozenset(FOLDER_NAMES.values())
 ALLOWED_CATEGORIES = frozenset(
     tuple(URGENCY_CATEGORIES.values())
     + tuple(TOPIC_CATEGORIES.values())
@@ -85,7 +84,7 @@ def permitted_folders(record: ReviewRecord) -> tuple[str, ...]:
         or record.processing_error
     ):
         return (FOLDER_NAMES[Route.NEEDS_REVIEW],)
-    return tuple(FOLDER_NAMES[route] for route in (Route.NEEDS_REPLY, Route.NO_REPLY))
+    return (record.target_folder,)
 
 
 def may_draft_reply(record: ReviewRecord) -> bool:
@@ -105,7 +104,7 @@ def validate_action(
 
     if action.kind == ActionKind.FILE_MESSAGE:
         folder = (action.folder or "").strip()
-        if folder not in ALLOWED_FOLDERS:
+        if not folder.startswith("AI Triage/"):
             raise PolicyViolation(f"unknown folder {folder!r}")
         allowed = permitted_folders(record)
         if folder not in allowed:

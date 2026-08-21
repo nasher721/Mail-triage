@@ -263,6 +263,7 @@ private struct ResultDetailView: View {
 private final class LearningControlsState: ObservableObject {
     @Published var routePreference = ""
     @Published var replyGuidance = ""
+    @Published var destinationFolder = ""
     @Published var loaded = false
 }
 
@@ -286,6 +287,12 @@ private struct LearningControls: View {
                     Text("Always review").tag("needs_review")
                 }
 
+                TextField("Future folder", text: $state.destinationFolder)
+                    .textFieldStyle(.roundedBorder)
+                Text("Optional. Use a path beneath AI Triage, such as AI Triage/Receipts. Mail Triage creates it only when you apply a reviewed run.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
                 TextEditor(text: $state.replyGuidance)
                     .font(.body)
                     .frame(minHeight: 80)
@@ -305,7 +312,8 @@ private struct LearningControls: View {
                         store.saveLearningPreference(
                             for: record,
                             route: state.routePreference.isEmpty ? nil : state.routePreference,
-                            replyGuidance: state.replyGuidance
+                            replyGuidance: state.replyGuidance,
+                            destinationFolder: state.destinationFolder
                         )
                     }
                 }
@@ -325,6 +333,7 @@ private struct LearningControls: View {
         let preference = store.learningPreference(for: record)
         state.routePreference = preference?.route ?? ""
         state.replyGuidance = preference?.replyGuidance ?? ""
+        state.destinationFolder = preference?.destinationFolder ?? ""
         state.loaded = true
     }
 }

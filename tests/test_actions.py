@@ -1,3 +1,4 @@
+from dataclasses import replace
 import unittest
 
 from email_triage.actions import (
@@ -100,6 +101,22 @@ class PolicyTests(unittest.TestCase):
             validate_action(
                 MailboxAction(ActionKind.FILE_MESSAGE, folder="Archive"),
                 needs_reply_record(),
+                allow_mark_read=False,
+            )
+
+    def test_record_selected_custom_folder_is_the_only_permitted_destination(self) -> None:
+        record = replace(needs_reply_record(), target_folder="AI Triage/Receipts")
+        self.assertEqual(permitted_folders(record), ("AI Triage/Receipts",))
+        action = validate_action(
+            MailboxAction(ActionKind.FILE_MESSAGE, folder="AI Triage/Receipts"),
+            record,
+            allow_mark_read=False,
+        )
+        self.assertEqual(action.folder, "AI Triage/Receipts")
+        with self.assertRaisesRegex(PolicyViolation, "not permitted"):
+            validate_action(
+                MailboxAction(ActionKind.FILE_MESSAGE, folder="AI Triage/Needs Reply"),
+                record,
                 allow_mark_read=False,
             )
 

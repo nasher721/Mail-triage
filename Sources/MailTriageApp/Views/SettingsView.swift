@@ -71,6 +71,14 @@ struct SettingsView: View {
 
             Section("Processing") {
                 Stepper("Maximum messages: \(store.maxMessages)", value: $store.maxMessages, in: 1...200)
+                HStack {
+                    Text("Inbox zero batch")
+                    Spacer()
+                    Button("Process up to 200") { store.maxMessages = 200 }
+                }
+                Text("Apply mode files each successfully screened message out of Inbox. Use preview first; repeat batches if more than 200 unread messages remain.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 Stepper(
                     "Body characters per message: \(store.maxBodyCharacters)",
                     value: $store.maxBodyCharacters,

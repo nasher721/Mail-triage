@@ -304,13 +304,15 @@ final class AppStore: ObservableObject {
     func saveLearningPreference(
         for record: TriageRecord,
         route: String?,
-        replyGuidance: String
+        replyGuidance: String,
+        destinationFolder: String
     ) {
         do {
             try learningPreferences.save(
                 senderAddress: record.senderAddress,
                 route: route,
-                replyGuidance: replyGuidance
+                replyGuidance: replyGuidance,
+                destinationFolder: destinationFolder
             )
             learningRevision += 1
             activity.insert(

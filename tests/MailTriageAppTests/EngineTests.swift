@@ -162,6 +162,25 @@ private func hosted(
     #expect(AppStore.modelNames(from: Data("not json".utf8), provider: .ollama).isEmpty)
 }
 
+@Test func learningPreferencesKeepCustomDestinationsLocalAndSafe() throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let file = directory.appendingPathComponent("preferences.json")
+    let store = LearningPreferenceStore(fileURL: file)
+
+    try store.save(
+        senderAddress: "Alex@Example.org",
+        route: "no_reply",
+        replyGuidance: "Keep it brief.",
+        destinationFolder: "AI Triage/Receipts"
+    )
+
+    let restored = LearningPreferenceStore(fileURL: file).preference(for: "sam@example.org")
+    #expect(restored?.route == "no_reply")
+    #expect(restored?.destinationFolder == "AI Triage/Receipts")
+    #expect(restored?.replyGuidance == "Keep it brief.")
+}
+
 @Test func diagnosticParserDecodesCapabilities() throws {
     let json = #"{"capabilities":{"source":"owa","authentication":"existing_edge_session","read_scope":"unread_inbox","supports_apply":true,"metadata_prefilter":true},"readiness":{"available":false,"code":"cdp_unreachable","detail":"No session"}}"#
 

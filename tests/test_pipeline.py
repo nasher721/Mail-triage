@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import json
 from pathlib import Path
 from stat import S_IMODE
 
@@ -143,6 +144,35 @@ class PipelineTests(unittest.TestCase):
         self.assertFalse(record.analysis.response_required)
         self.assertIsNone(record.analysis.suggested_reply)
 
+    def test_local_preference_can_file_a_sender_into_a_safe_custom_folder(self):
+        preferences = FeedbackPreferences(
+            (FeedbackPreference("example.org", destination_folder="AI Triage/Receipts"),)
+        )
+        record = process_message(self.message(), FakeClassifier(), 12_000, preferences=preferences)
+        self.assertEqual(record.target_folder, "AI Triage/Receipts")
+
+    def test_custom_destination_is_ignored_for_clinical_manual_review(self):
+        preferences = FeedbackPreferences(
+            (FeedbackPreference("example.org", destination_folder="AI Triage/Receipts"),)
+        )
+        record = process_message(
+            self.message(body="Please review the patient's clinical status."),
+            FakeClassifier(),
+            12_000,
+            preferences=preferences,
+        )
+        self.assertEqual(record.target_folder, "AI Triage/Needs Review")
+
+    def test_invalid_preference_destination_is_not_loaded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "preferences.json"
+            path.write_text(
+                json.dumps({"preferences": [{"sender_domain": "example.org", "destination_folder": "Archive"}]}),
+                encoding="utf-8",
+            )
+            preferences = FeedbackPreferences.from_path(path)
+        self.assertIsNone(preferences.for_sender("alex@example.org"))
+
     def test_newsletter_is_only_suggested_for_manual_unsubscribe(self):
         result = needs_reply_result()
         result = result.__class__(
@@ -168,6 +198,7 @@ class PipelineTests(unittest.TestCase):
             12_000,
         )
         self.assertTrue(record.unsubscribe_suggestion)
+        self.assertEqual(record.target_folder, "AI Triage/Newsletters")
 
     def test_local_queue_does_not_store_message_body_and_is_idempotent(self):
         record = process_message(self.message(), FakeClassifier(), 12_000)

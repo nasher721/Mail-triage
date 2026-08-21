@@ -424,6 +424,10 @@ def run(args: argparse.Namespace) -> int:
     )
     if settings.apply_changes:
         summary += " Mailbox updated; no mail was sent, forwarded, or deleted."
+        if failures:
+            summary += " Inbox-zero filing is pending for messages with failed actions."
+        else:
+            summary += " Every screened message was filed out of Inbox."
     else:
         summary += " Preview only; the mailbox was not modified."
     print(summary, file=sys.stderr)

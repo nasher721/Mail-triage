@@ -144,6 +144,9 @@ struct OverviewView: View {
                     Text(privacyDetail)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
+                    Text("Inbox zero: in Apply mode, every successfully screened message is filed into an AI Triage subfolder. Messages are never deleted; any failed action remains visible for review.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
             }
             .padding(6)

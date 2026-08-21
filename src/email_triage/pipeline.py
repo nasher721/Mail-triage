@@ -26,6 +26,10 @@ FOLDER_NAMES = {
     Route.NEEDS_REPLY: "AI Triage/Needs Reply",
     Route.NO_REPLY: "AI Triage/No Reply Needed",
 }
+
+NEWSLETTER_FOLDER = "AI Triage/Newsletters"
+READING_FOLDER = "AI Triage/Read Later"
+ADMIN_FOLDER = "AI Triage/Administrative"
 URGENCY_CATEGORIES = {
     Urgency.URGENT: "AI - Urgent",
     Urgency.SOON: "AI - Soon",
@@ -57,6 +61,20 @@ def suggest_unsubscribe(message: GraphMessage, body: str, result: ScreeningResul
         token in text for token in ("newsletter", "weekly digest", "promotions", "subscribe")
     )
     return has_opt_out and has_newsletter_signal
+
+
+def cleanup_folder(result: ScreeningResult, unsubscribe_suggestion: bool) -> str:
+    """Choose a reviewable subfolder for messages that need no reply."""
+
+    if result.route != Route.NO_REPLY:
+        return FOLDER_NAMES[result.route]
+    if unsubscribe_suggestion:
+        return NEWSLETTER_FOLDER
+    if result.topic == Topic.EDUCATION_RESEARCH:
+        return READING_FOLDER
+    if result.topic == Topic.ADMINISTRATIVE:
+        return ADMIN_FOLDER
+    return FOLDER_NAMES[Route.NO_REPLY]
 
 
 def _manual_review(reason: ManualReviewReason, processing_error: bool = False) -> ScreeningResult:
@@ -180,6 +198,8 @@ def process_message(
     else:
         categories.append("AI - Processed")
 
+    unsubscribe_suggestion = suggest_unsubscribe(message, body, result)
+    preferred_folder = FeedbackPreferences.destination_for(result, preference)
     return ReviewRecord(
         message_id=message.id,
         internet_message_id=message.internet_message_id,
@@ -189,10 +209,10 @@ def process_message(
         received_at=message.received_at,
         sensitivity=message.sensitivity,
         has_attachments=message.has_attachments,
-        target_folder=FOLDER_NAMES[result.route],
+        target_folder=preferred_folder or cleanup_folder(result, unsubscribe_suggestion),
         categories=tuple(categories),
         analysis=result,
-        unsubscribe_suggestion=suggest_unsubscribe(message, body, result),
+        unsubscribe_suggestion=unsubscribe_suggestion,
         processing_error=processing_error,
     )
 

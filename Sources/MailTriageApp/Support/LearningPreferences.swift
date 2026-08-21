@@ -5,6 +5,7 @@ struct LearningPreference: Codable, Equatable, Identifiable {
     var senderDomain: String
     var route: String?
     var replyGuidance: String
+    var destinationFolder: String?
 
     var id: String { senderDomain }
 
@@ -12,11 +13,12 @@ struct LearningPreference: Codable, Equatable, Identifiable {
         case senderDomain = "sender_domain"
         case route
         case replyGuidance = "reply_guidance"
+        case destinationFolder = "destination_folder"
     }
 }
 
 struct LearningPreferenceDocument: Codable {
-    let version = 1
+    var version = 1
     var preferences: [LearningPreference]
 }
 
@@ -36,19 +38,26 @@ final class LearningPreferenceStore {
         return preferences.first { $0.senderDomain == domain.lowercased() }
     }
 
-    func save(senderAddress: String, route: String?, replyGuidance: String) throws {
+    func save(
+        senderAddress: String,
+        route: String?,
+        replyGuidance: String,
+        destinationFolder: String
+    ) throws {
         guard let domain = senderAddress.split(separator: "@", maxSplits: 1).last,
               senderAddress.contains("@") else {
             throw LearningPreferenceError.missingSenderDomain
         }
         let normalizedRoute = route == "no_reply" || route == "needs_review" ? route : nil
+        let normalizedFolder = normalizedDestination(destinationFolder)
         let preference = LearningPreference(
             senderDomain: domain.lowercased(),
             route: normalizedRoute,
-            replyGuidance: String(replyGuidance.trimmingCharacters(in: .whitespacesAndNewlines).prefix(400))
+            replyGuidance: String(replyGuidance.trimmingCharacters(in: .whitespacesAndNewlines).prefix(400)),
+            destinationFolder: normalizedFolder.isEmpty ? nil : normalizedFolder
         )
         preferences.removeAll { $0.senderDomain == preference.senderDomain }
-        if preference.route != nil || !preference.replyGuidance.isEmpty {
+        if preference.route != nil || !preference.replyGuidance.isEmpty || preference.destinationFolder != nil {
             preferences.append(preference)
         }
         try persist()
@@ -72,6 +81,15 @@ final class LearningPreferenceStore {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         try encoder.encode(LearningPreferenceDocument(preferences: preferences)).write(to: fileURL, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
+    }
+
+    private func normalizedDestination(_ value: String) -> String {
+        let parts = value.split(separator: "/").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        guard (2...4).contains(parts.count), parts.first == "AI Triage",
+              !parts.contains(where: { $0 == "." || $0 == ".." || $0.count > 64 }) else {
+            return ""
+        }
+        return parts.joined(separator: "/")
     }
 }
 
