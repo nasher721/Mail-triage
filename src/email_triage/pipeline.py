@@ -75,6 +75,25 @@ def _manual_review(reason: ManualReviewReason, processing_error: bool = False) -
     )
 
 
+def _no_reply_sender_result() -> ScreeningResult:
+    """Deterministic metadata-only result for automated sender addresses."""
+
+    return ScreeningResult(
+        summary="Automated sender address does not accept replies.",
+        priority_score=1,
+        action_items=(),
+        route=Route.NO_REPLY,
+        response_required=False,
+        confidence=Confidence.HIGH,
+        urgency=Urgency.ROUTINE,
+        deadline=None,
+        topic=Topic.OTHER,
+        manual_review_reason=None,
+        rationale="No-reply sender; file without body analysis.",
+        suggested_reply=None,
+    )
+
+
 def enforce_route(result: ScreeningResult, no_reply_sender: bool) -> ScreeningResult:
     """Apply deterministic routing after schema validation."""
 
@@ -120,6 +139,8 @@ def process_message(
     processing_error: str | None = None
     if local_reason is not None:
         result = _manual_review(local_reason)
+    elif message.is_no_reply_sender:
+        result = _no_reply_sender_result()
     else:
         try:
             result = classifier.classify(body, message.has_attachments)
@@ -177,6 +198,12 @@ class LocalQueue:
 
     def contains(self, message_id: str) -> bool:
         return message_id in self._seen
+
+    @property
+    def seen_ids(self) -> set[str]:
+        """Copy IDs for metadata-stage exclusion during incremental scans."""
+
+        return set(self._seen)
 
     def append(self, record: ReviewRecord) -> None:
         self._prepare()

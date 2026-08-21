@@ -8,13 +8,20 @@ import time
 from pathlib import Path
 
 from email_triage.actions import default_plan
+from email_triage.accessibility import (
+    OutlookAccessibilityMailbox,
+    accessibility_diagnostic,
+)
 from email_triage.agent import DeterministicSortingAgent, OllamaSortingAgent
 from email_triage.apply import ActionLog, DryRunActuator, GraphActuator, apply_plan
+from email_triage.backends import backend_capabilities
 from email_triage.classifier import _list_ollama_models, build_classifier, resolve_ollama_model
 from email_triage.config import ConfigurationError, Settings
+from email_triage.desktop import OutlookDesktopMailbox, desktop_diagnostic
 from email_triage.graph import GraphError, GraphMailbox
 from email_triage.local_mailbox import LocalMailbox
-from email_triage.owa import OwaMailbox
+from email_triage.live_probe import run_live_probe
+from email_triage.owa import OwaMailbox, edge_debug_available
 from email_triage.pipeline import LocalQueue, process_message
 from email_triage.runtime import LockBusy, is_interactive, load_env_file, single_instance_lock
 
@@ -41,8 +48,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--source",
-        choices=("graph", "local", "owa"),
+        choices=("graph", "local", "owa", "desktop", "accessibility"),
         help="Mailbox source. --owa is the same as --source owa.",
+    )
+    parser.add_argument(
+        "--diagnose",
+        action="store_true",
+        help=(
+            "Print a metadata-only backend capability/readiness report and exit. "
+            "No mailbox content is read and no model is contacted."
+        ),
+    )
+    parser.add_argument(
+        "--live-probe",
+        action="store_true",
+        help=(
+            "Opt in to one real, read-only backend request. No model is contacted, "
+            "no mailbox data is printed or retained, and apply mode is never used."
+        ),
     )
     parser.add_argument(
         "--watch",
@@ -111,6 +134,57 @@ def _cli_source(args: argparse.Namespace) -> str | None:
     return args.source
 
 
+def _diagnostic_report(args: argparse.Namespace) -> dict[str, object]:
+    """Check backend readiness without reading mail, tokens, or model state."""
+
+    source = _cli_source(args) or os.getenv("TRIAGE_SOURCE", "").strip().lower()
+    if not source:
+        graph_configured = bool(os.getenv("MS_TENANT_ID", "").strip()) and bool(
+            os.getenv("MS_CLIENT_ID", "").strip()
+        )
+        source = "local" if args.input else ("graph" if graph_configured else "owa")
+    if source not in {"graph", "local", "owa", "desktop", "accessibility"}:
+        raise ConfigurationError(
+            "TRIAGE_SOURCE must be graph, local, owa, desktop, or accessibility"
+        )
+    report: dict[str, object] = {"capabilities": backend_capabilities(source).to_dict()}
+    if source == "owa":
+        cdp_url = (
+            os.getenv("EDGE_CDP_URL", "").strip()
+            or os.getenv("OWA_CDP_URL", "").strip()
+            or "http://127.0.0.1:9222"
+        )
+        available = edge_debug_available(cdp_url)
+        report["readiness"] = {
+            "available": available,
+            "code": "ready" if available else "cdp_unreachable",
+            "detail": "Edge debugging endpoint only; no session token or mail was read.",
+        }
+    elif source == "desktop":
+        report["readiness"] = desktop_diagnostic().to_dict()
+    elif source == "accessibility":
+        report["readiness"] = accessibility_diagnostic().to_dict()
+    elif source == "local":
+        raw_path = args.input or os.getenv("TRIAGE_INPUT", "")
+        path = Path(raw_path).expanduser() if raw_path else None
+        available = path is not None and path.exists()
+        report["readiness"] = {
+            "available": available,
+            "code": "ready" if available else "input_missing",
+            "detail": "Checks only whether the selected local path exists.",
+        }
+    else:
+        available = bool(os.getenv("MS_TENANT_ID", "").strip()) and bool(
+            os.getenv("MS_CLIENT_ID", "").strip()
+        )
+        report["readiness"] = {
+            "available": available,
+            "code": "configured" if available else "credentials_missing",
+            "detail": "Checks configuration presence only; no authentication was attempted.",
+        }
+    return report
+
+
 def _build_graph_mailbox(settings: Settings, interactive: bool) -> GraphMailbox:
     return GraphMailbox(
         settings.tenant_id,
@@ -118,6 +192,7 @@ def _build_graph_mailbox(settings: Settings, interactive: bool) -> GraphMailbox:
         settings.output_dir / "oauth_token_cache.json",
         read_write=settings.apply_changes,
         interactive=interactive,
+        max_scan_pages=settings.max_retrieval_pages,
     )
 
 
@@ -151,16 +226,40 @@ def run(args: argparse.Namespace) -> int:
     if settings.mailbox_source == "local":
         if settings.input_path is None:
             raise ConfigurationError("Local mailbox source is missing an input path")
-        mailbox_source: GraphMailbox | LocalMailbox | OwaMailbox = LocalMailbox(
+        mailbox_source: (
+            GraphMailbox
+            | LocalMailbox
+            | OwaMailbox
+            | OutlookDesktopMailbox
+            | OutlookAccessibilityMailbox
+        ) = LocalMailbox(
             settings.input_path
         )
         print(f"Using local mailbox {settings.input_path}.", file=sys.stderr)
     elif settings.mailbox_source == "owa":
-        live_mailbox = OwaMailbox(settings.owa_cdp_url, read_write=settings.apply_changes)
+        live_mailbox = OwaMailbox(
+            settings.owa_cdp_url,
+            read_write=settings.apply_changes,
+            max_scan_pages=settings.max_retrieval_pages,
+        )
         mailbox_source = live_mailbox
         print(
             f"Using Outlook on the web in Edge at {settings.owa_cdp_url}. "
             "Mail is never sent.",
+            file=sys.stderr,
+        )
+    elif settings.mailbox_source == "desktop":
+        mailbox_source = OutlookDesktopMailbox()
+        print(
+            "Using one user-opened, frontmost Outlook message through macOS "
+            "Accessibility. This adapter is read-only and never enumerates the mailbox.",
+            file=sys.stderr,
+        )
+    elif settings.mailbox_source == "accessibility":
+        mailbox_source = OutlookAccessibilityMailbox()
+        print(
+            "Using currently visible unread rows in the already-open Outlook Inbox "
+            "through macOS Accessibility. This adapter is preview-only.",
             file=sys.stderr,
         )
     else:
@@ -208,7 +307,10 @@ def run(args: argparse.Namespace) -> int:
     processed = 0
     skipped = 0
     failures = 0
-    for message in mailbox_source.unread_messages(settings.max_unread_messages):
+    excluded = set() if args.include_previously_processed else queue.seen_ids
+    for message in mailbox_source.unread_messages(
+        settings.max_unread_messages, exclude_ids=excluded
+    ):
         if queue.contains(message.id) and not args.include_previously_processed:
             skipped += 1
             continue
@@ -263,6 +365,29 @@ def main(argv: list[str] | None = None) -> int:
                 "Ignoring --input; --owa reads the live Outlook tab in Edge.",
                 file=sys.stderr,
             )
+        if args.diagnose and args.live_probe:
+            raise ConfigurationError("--diagnose and --live-probe are mutually exclusive")
+        if args.diagnose:
+            print(json.dumps(_diagnostic_report(args), sort_keys=True))
+            return 0
+        if args.live_probe:
+            if args.apply or args.mark_read or args.login or args.watch is not None:
+                raise ConfigurationError(
+                    "--live-probe cannot be combined with --apply, --mark-read, "
+                    "--login, or --watch"
+                )
+            source = _cli_source(args)
+            if source is None:
+                raise ConfigurationError(
+                    "--live-probe requires an explicit --source graph|owa|desktop"
+                )
+            if source == "local" or args.input:
+                raise ConfigurationError(
+                    "--live-probe supports only graph, owa, or desktop without --input"
+                )
+            result = run_live_probe(source)
+            print(json.dumps(result.to_dict(), sort_keys=True))
+            return 0 if result.available else 2
         output_dir = Path(os.getenv("TRIAGE_OUTPUT_DIR", "var")).expanduser()
         watch_seconds = args.watch
         if watch_seconds is not None and watch_seconds < 1:

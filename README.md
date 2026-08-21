@@ -1,8 +1,55 @@
-# Local Outlook Email Triage (Python)
+# Mail Triage for macOS
 
-Reads unread Inbox mail through Microsoft Graph delegated OAuth, screens each message with a **local Ollama model**, drafts replies where a reply is warranted, and then lets a **local tool-calling agent sort the mail in Outlook**: triage folders, categories, unsent reply drafts, and optionally marking messages read.
+See the [Outlook integration roadmap](docs/outlook-integration-roadmap.md) for the
+completed reliability/privacy backlog and prohibited-feature boundaries.
+
+Reads unread Inbox mail through the user's normal Outlook Web session by default—
+no Graph app registration, tenant ID, client ID, API key, or administrator
+approval required. Microsoft Graph remains an optional organization-approved
+backend. Each message is screened by a **local Ollama model**, and a **local
+tool-calling agent** can sort mail into triage folders with unsent reply drafts.
 
 Nothing is ever sent, forwarded, or deleted. The application does not hold the `Mail.Send` scope, and no send/forward/delete call exists anywhere in the code (enforced by a test).
+
+## Native Mac app
+
+Mail Triage includes a native SwiftUI application with:
+
+- credential-free Outlook on the Web setup and readiness diagnostics;
+- local Ollama configuration and automatic model selection;
+- preview and explicitly confirmed apply modes;
+- a results browser for routes, priorities, summaries, action items, suggested
+  replies, and planned/applied actions;
+- a redacted activity log plus a dedicated macOS Settings window;
+- local export and bounded macOS Accessibility sources;
+- no shell interpolation, embedded credentials, or application-managed token files.
+
+Build and launch a real ad-hoc-signed app bundle:
+
+```bash
+./script/build_and_run.sh
+```
+
+The bundle is created at `dist/Mail Triage.app`. The same command is exposed as
+the Codex desktop Run action through `.codex/environments/environment.toml`.
+Useful verification modes are:
+
+```bash
+./script/build_and_run.sh --verify
+./script/test_mac_app.sh
+```
+
+The app bundles `email_triage_standalone.py` and the dedicated Edge helper as
+resources. It locates an installed Python 3.11+ runtime and uses the existing
+local Playwright installation for OWA. Install the OWA extra once when needed:
+
+```bash
+python3 -m pip install 'playwright>=1.40'
+```
+
+In the app, choose **Open Outlook Session**, complete the normal Microsoft
+sign-in in the dedicated Edge window once, and return to Mail Triage. The app
+does not request a tenant ID, client ID, Graph secret, or administrator bypass.
 
 ## What runs where
 
@@ -11,7 +58,7 @@ Nothing is ever sent, forwarded, or deleted. The application does not hold the `
 | Read unread mail | Outlook-in-Edge session (`--owa`) or Microsoft Graph | Microsoft only |
 | Screen + draft reply | Ollama on `127.0.0.1` | none |
 | Plan mailbox actions | Ollama tool-calling agent | none |
-| Apply actions | Microsoft Graph | Microsoft only |
+| Apply actions | Outlook-in-Edge or Microsoft Graph | Microsoft only |
 
 `TRIAGE_BACKEND=openai` is still available for screening, but it requires a key and an explicit `EXTERNAL_AI_APPROVED=true`. The sorting agent is always local.
 
@@ -38,7 +85,9 @@ Nothing is ever sent, forwarded, or deleted. The application does not hold the `
 
 `var/review_queue.jsonl` records metadata and the structured result, `var/applied_actions.jsonl` records every action planned or applied. Neither stores the message body. Files under `var/` are owner-only and Git-ignored.
 
-## Microsoft Entra setup
+## Optional Microsoft Entra setup
+
+Skip this entire section when using the default credential-free Outlook Web path.
 
 1. Create a single-tenant app registration in Microsoft Entra ID.
 2. Enable public-client/device-code authentication.
@@ -68,15 +117,29 @@ ollama serve && ollama pull qwen3:8b
 
 ## Run
 
-If Outlook is already open in Microsoft Edge (Outlook on the web), you do **not** need an Entra admin app, `.eml` export, or Windows COM/`pywin32`. COM only talks to desktop Outlook on Windows. On macOS the script attaches to the signed-in Edge tab and reuses that session.
+The default path uses a dedicated Edge profile and the user's normal Outlook Web
+login. You do **not** need an Entra app, Graph credentials, `.eml` export, or
+Windows COM/`pywin32`. Existing Edge windows are never closed.
 
 One-time setup, then leave Edge open:
 
 ```bash
-python3 -m pip install --user playwright
+python3 -m pip install -e '.[owa]'
 bash scripts/open_outlook_in_edge.sh
-python3 email_triage_standalone.py --owa --apply --watch
+email-triage --owa
 ```
+
+Sign in normally in the dedicated Outlook window if prompted. Edge persists its
+login state in the owner-only `~/Library/Application Support/MailTriage/EdgeProfile`
+directory, separate from result exports. The application
+captures a first-party Outlook bearer only in memory, filters replayed cookies to
+`outlook.office.com`, supplies `X-AnchorMailbox`, and bounds reauthentication to
+one retry. It never creates its own raw-token or cookie file. The helper rejects
+an already-occupied CDP port unless its endpoint fingerprint matches the
+owner-only profile marker. A malicious process running as the same macOS user
+remains inside the local trust boundary and could inspect that user's browser
+processes or files; use a separate OS account if that threat matters. Add
+`--apply --watch` only when mailbox organization is desired.
 
 `--watch` keeps screening every 5 minutes with no further input. Replies are saved as **unsent drafts**. Nothing is sent.
 
@@ -86,11 +149,11 @@ Preview against synthetic mail, no Microsoft account needed:
 email-triage --input samples/inbox.jsonl
 ```
 
-Preview against the real mailbox — reads unread mail, changes nothing:
+Use the optional registered Graph backend instead:
 
 ```bash
 export MS_TENANT_ID="your-tenant-id" MS_CLIENT_ID="your-client-id"
-email-triage
+email-triage --source graph
 ```
 
 Sort the mailbox for real — moves messages into `AI Triage/…`, applies categories, saves unsent reply drafts:
@@ -108,6 +171,50 @@ email-triage --apply --mark-read
 Other flags: `--no-agent` uses the deterministic plan only; `--include-previously-processed` re-screens message IDs already in the local state file.
 
 Each processed message prints one JSON line containing the screening result, `plan_source`, and the action outcomes. Exit codes: `0` success (or a skipped run because another copy holds the lock), `1` at least one action failed, `2` configuration or Graph error.
+
+Inspect backend readiness without reading mail, capturing a token, or contacting a
+model:
+
+```bash
+email-triage --source owa --diagnose
+```
+
+To validate one real backend connection, opt in explicitly:
+
+```bash
+email-triage --source graph --live-probe
+email-triage --source owa --live-probe
+email-triage --source desktop --live-probe
+```
+
+The live probe never contacts a model or mutates the mailbox. Graph and OWA make
+one `$top=1&$select=id` request, discard the HTTP response without parsing it,
+and do not persist refreshed credentials. The desktop probe checks only that
+Outlook has a front window through Accessibility; it does not read visible text.
+Output is fixed, redacted JSON with no token, message ID, subject, body, account,
+attachment, response body, or request URL. `--source` is required, the Edge
+debugging endpoint must be loopback-only, and write/login/watch flags are rejected.
+Python attachment uses detach-only cleanup; the helper launches only its dedicated
+profile and never closes the user's existing browser windows.
+
+For a second credential-free macOS option, `--source accessibility` adapts the
+MIT reader patterns from `Arkya-AI/outlook-email-scanner`. It reads only
+explicitly-unread rows currently visible in an already-open Outlook Inbox and is
+metadata-only and preview-only: no row selection, activation, navigation,
+scrolling, attachment inspection, or mailbox writes. It classifies only the
+subject/sender/preview text already exposed in each visible row. This
+experimental source recognizes a separately installed
+`atomacos`; it is intentionally not a core dependency because that stale GPLv2
+package has conflicting dependency constraints. The single-front-window
+`--source desktop` adapter remains dependency-free.
+
+See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for pinned upstream commits,
+license notices, and the explicit exclusion of the MAM-bypass repository.
+
+On macOS, `email-triage --source desktop` can screen the title of the single
+Outlook message opened in the frontmost window. This metadata-only adapter does
+not enumerate the window's static text, click, scroll, enumerate mail, inspect
+attachment names/content, or apply changes.
 
 ## Unattended operation
 

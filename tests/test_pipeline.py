@@ -7,6 +7,7 @@ from email_triage.classifier import ClassificationError
 from email_triage.models import (
     Confidence,
     GraphMessage,
+    ManualReviewReason,
     Route,
     ScreeningResult,
     Topic,
@@ -66,13 +67,32 @@ class PipelineTests(unittest.TestCase):
         self.assertTrue(record.analysis.suggested_reply.endswith("Best,\nNick"))
 
     def test_no_reply_sender_is_forced_to_no_reply(self):
+        classifier = FakeClassifier()
         record = process_message(
             self.message(sender_address="no-reply@example.org"),
-            FakeClassifier(),
+            classifier,
             12_000,
         )
         self.assertEqual(record.analysis.route, Route.NO_REPLY)
         self.assertIsNone(record.analysis.suggested_reply)
+        self.assertEqual(classifier.calls, 0)
+
+    def test_no_reply_sender_does_not_bypass_local_clinical_review(self):
+        classifier = FakeClassifier()
+        record = process_message(
+            self.message(
+                sender_address="no-reply@example.org",
+                body="The patient has a new diagnosis and medication change.",
+            ),
+            classifier,
+            12_000,
+        )
+        self.assertEqual(record.analysis.route, Route.NEEDS_REVIEW)
+        self.assertEqual(
+            record.analysis.manual_review_reason,
+            ManualReviewReason.CLINICAL_OR_PATIENT,
+        )
+        self.assertEqual(classifier.calls, 0)
 
     def test_clinical_body_never_reaches_classifier(self):
         classifier = FakeClassifier()

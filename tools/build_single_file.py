@@ -29,6 +29,9 @@ BUNDLE = ROOT / "email_triage_standalone.py"
 MODULE_ORDER = (
     "models",
     "config",
+    "backends",
+    "desktop",
+    "accessibility",
     "safety",
     "classifier",
     "pipeline",
@@ -39,12 +42,16 @@ MODULE_ORDER = (
     "local_mailbox",
     "apply",
     "runtime",
+    "live_probe",
     "cli",
 )
 
 TEST_ORDER = (
     "test_models",
     "test_config",
+    "test_backends",
+    "test_desktop",
+    "test_accessibility",
     "test_safety",
     "test_classifier",
     "test_local_mailbox",
@@ -55,6 +62,8 @@ TEST_ORDER = (
     "test_agent",
     "test_apply",
     "test_runtime",
+    "test_cli",
+    "test_live_probe",
 )
 
 HEADER = '''#!/usr/bin/env python3

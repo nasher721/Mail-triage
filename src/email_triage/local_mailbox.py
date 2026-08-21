@@ -18,7 +18,9 @@ class LocalMailbox:
     def __init__(self, path: Path):
         self.path = path
 
-    def unread_messages(self, limit: int) -> list[GraphMessage]:
+    def unread_messages(
+        self, limit: int, exclude_ids: set[str] | None = None
+    ) -> list[GraphMessage]:
         if not self.path.exists():
             raise ConfigurationError(f"Input path does not exist: {self.path}")
         messages: list[GraphMessage] = []
@@ -26,7 +28,8 @@ class LocalMailbox:
             messages.extend(_load_file(source, index))
             if len(messages) >= limit:
                 break
-        return messages[:limit]
+        excluded = exclude_ids or set()
+        return [message for message in messages if message.id not in excluded][:limit]
 
 
 def _iter_source_files(path: Path) -> list[Path]:

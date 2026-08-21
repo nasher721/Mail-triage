@@ -1,52 +1,114 @@
 #!/bin/zsh
-# Relaunch Microsoft Edge with a user-level debugging port so triage can reuse
-# the already-signed-in Outlook on the web tab. No admin rights required.
-#
-# Chrome DevTools Protocol cannot attach to an Edge that was started without
-# --remote-debugging-port, so this script quits Edge once and starts it again.
-# After that, leave the Outlook window open and run:
-#   python3 email_triage_standalone.py --owa --apply --watch
+# Starts a dedicated, persistent Edge profile for credential-free Outlook Web
+# access. Raw bearer tokens are never copied out of the browser profile.
 
 set -euo pipefail
 
 CDP_URL="${EDGE_CDP_URL:-http://127.0.0.1:9222}"
-PORT="${CDP_URL##*:}"
-EDGE="${EDGE_BIN:-/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge}"
+EDGE_BIN_PATH="${EDGE_BIN:-/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge}"
+EDGE_APP_PATH="${EDGE_APP:-/Applications/Microsoft Edge.app}"
 OUTLOOK_URL="${OWA_URL:-https://outlook.office.com/mail/inbox}"
+PROFILE_DIR="${EDGE_PROFILE_DIR:-${HOME}/Library/Application Support/MailTriage/EdgeProfile}"
 
-if curl -sf "${CDP_URL}/json/version" >/dev/null; then
-  echo "Microsoft Edge already has remote debugging on ${CDP_URL}."
-  echo "Keep the Outlook tab open, then run:"
-  echo "  python3 email_triage_standalone.py --owa --apply --watch"
-  exit 0
+case "$CDP_URL" in
+  http://127.0.0.1:*|http://localhost:*) ;;
+  *)
+    echo "EDGE_CDP_URL must use loopback HTTP (127.0.0.1 or localhost)." >&2
+    exit 2
+    ;;
+esac
+
+PORT="${CDP_URL##*:}"
+case "$PORT" in
+  ''|*[!0-9]*)
+    echo "EDGE_CDP_URL must include a numeric port." >&2
+    exit 2
+    ;;
+esac
+if (( PORT < 1 || PORT > 65535 )); then
+  echo "EDGE_CDP_URL port must be between 1 and 65535." >&2
+  exit 2
 fi
 
-if [[ ! -x "$EDGE" ]]; then
-  echo "Microsoft Edge was not found at $EDGE" >&2
-  echo "Install Edge for this user, or set EDGE_BIN to the browser binary." >&2
+case "$OUTLOOK_URL" in
+  https://outlook.office.com/*|https://outlook.office365.com/*|https://outlook.live.com/*|https://outlook.cloud.microsoft/*) ;;
+  *)
+    echo "OWA_URL must be HTTPS on an approved Outlook host." >&2
+    exit 2
+    ;;
+esac
+
+if [[ -L "$PROFILE_DIR" ]]; then
+  echo "EDGE_PROFILE_DIR must not be a symbolic link." >&2
+  exit 2
+fi
+mkdir -p "$PROFILE_DIR"
+if [[ ! -d "$PROFILE_DIR" || -L "$PROFILE_DIR" ]]; then
+  echo "EDGE_PROFILE_DIR must be a real directory." >&2
+  exit 2
+fi
+if [[ "$(stat -f '%u' "$PROFILE_DIR")" != "$(id -u)" ]]; then
+  echo "EDGE_PROFILE_DIR must be owned by the current user." >&2
+  exit 2
+fi
+chmod 700 "$PROFILE_DIR"
+PROFILE_DIR="$(cd "$PROFILE_DIR" && pwd -P)"
+OWNER_MARKER="$PROFILE_DIR/.mail-triage-cdp-owner"
+
+endpoint_fingerprint() {
+  local version_json
+  version_json="$(curl -fsS "${CDP_URL}/json/version" 2>/dev/null)" || return 1
+  print -r -- "$version_json" \
+    | /usr/bin/sed -n 's/.*"webSocketDebuggerUrl"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
+}
+
+if current_fingerprint="$(endpoint_fingerprint)" && [[ -n "$current_fingerprint" ]]; then
+  if [[ -f "$OWNER_MARKER" && ! -L "$OWNER_MARKER" \
+        && "$(<"$OWNER_MARKER")" == "$current_fingerprint" ]]; then
+    echo "Credential-free Outlook session already available at ${CDP_URL}."
+    echo "Run email_triage_standalone.py --source owa to use it."
+    exit 0
+  fi
+  echo "Refusing an unrecognized process already listening at ${CDP_URL}. Choose another loopback port." >&2
+  exit 2
+fi
+
+if [[ ! -x "$EDGE_BIN_PATH" ]]; then
+  echo "Microsoft Edge was not found at ${EDGE_BIN_PATH}." >&2
+  echo "Install Edge for this user or set EDGE_BIN to its executable." >&2
   exit 1
 fi
 
-if pgrep -x "Microsoft Edge" >/dev/null; then
-  echo "Quitting Microsoft Edge so it can restart with remote debugging..."
-  osascript -e 'tell application "Microsoft Edge" to quit' >/dev/null 2>&1 || true
-  sleep 2
+echo "Starting separate Outlook Edge profile; existing Edge windows stay open."
+if [[ -d "$EDGE_APP_PATH" ]]; then
+  /usr/bin/open -na "$EDGE_APP_PATH" --args \
+    --user-data-dir="$PROFILE_DIR" \
+    --remote-debugging-address=127.0.0.1 \
+    --remote-debugging-port="$PORT" \
+    --no-first-run \
+    --no-default-browser-check \
+    "$OUTLOOK_URL"
+else
+  "$EDGE_BIN_PATH" \
+    --user-data-dir="$PROFILE_DIR" \
+    --remote-debugging-address=127.0.0.1 \
+    --remote-debugging-port="$PORT" \
+    --no-first-run \
+    --no-default-browser-check \
+    "$OUTLOOK_URL" >/dev/null 2>&1 &
+  disown
 fi
 
-echo "Starting Microsoft Edge with --remote-debugging-port=${PORT}..."
-"$EDGE" --remote-debugging-port="${PORT}" --restore-last-session "$OUTLOOK_URL" >/dev/null 2>&1 &
-disown
-
-for _ in {1..30}; do
-  if curl -sf "${CDP_URL}/json/version" >/dev/null; then
-    echo "Edge debugging is ready at ${CDP_URL}."
-    echo "Sign in to Outlook in that window if needed, then leave it open and run:"
-    echo "  python3 -m pip install --user playwright"
-    echo "  python3 email_triage_standalone.py --owa --apply --watch"
+for _ in {1..60}; do
+  if current_fingerprint="$(endpoint_fingerprint)" && [[ -n "$current_fingerprint" ]]; then
+    umask 077
+    print -r -- "$current_fingerprint" > "$OWNER_MARKER"
+    chmod 600 "$OWNER_MARKER"
+    echo "Outlook browser profile is ready at ${CDP_URL}."
     exit 0
   fi
   sleep 0.5
 done
 
-echo "Edge started but ${CDP_URL} never became ready." >&2
+echo "Edge started but its loopback debugging endpoint did not become ready." >&2
 exit 1

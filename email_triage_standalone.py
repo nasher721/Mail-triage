@@ -19,19 +19,29 @@ Run the bundled tests (no Microsoft or cloud AI calls):
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import fcntl
+import hashlib
+import importlib
 import io
 import ipaddress
 import json
 import os
+import platform
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import time
+import types
 import unittest
 from contextlib import contextmanager
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import asdict, dataclass
 from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from dataclasses import replace
 from datetime import datetime
 from email import policy
@@ -43,15 +53,22 @@ from html import unescape
 from html.parser import HTMLParser
 from pathlib import Path
 from stat import S_IMODE
+from types import ModuleType
 from typing import Any
+from typing import Any, Callable
 from typing import Any, Protocol
+from typing import Callable
 from typing import Iterator
 from typing import Protocol
+from unittest.mock import MagicMock, patch
 from unittest.mock import patch
+from urllib.error import HTTPError
 from urllib.error import HTTPError, URLError
-from urllib.error import URLError
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlparse
+from urllib.parse import quote, urlencode, urlparse
+from urllib.parse import quote, urlencode, urlsplit
 from urllib.parse import urlparse
+from urllib.request import Request
 from urllib.request import Request, urlopen
 
 __version__ = "0.1.0"
@@ -301,6 +318,21 @@ def is_loopback_url(url: str) -> bool:
         return False
 
 
+def _is_loopback_http_url(url: str) -> bool:
+    """Validate a local browser-debugging endpoint without resolving DNS."""
+    try:
+        parsed = urlparse(url)
+        return (
+            parsed.scheme == "http"
+            and parsed.username is None
+            and parsed.password is None
+            and parsed.hostname in {"127.0.0.1", "::1", "localhost"}
+            and parsed.port is not None
+        )
+    except ValueError:
+        return False
+
+
 @dataclass(frozen=True)
 class Settings:
     tenant_id: str
@@ -316,6 +348,7 @@ class Settings:
     input_path: Path | None
     owa_cdp_url: str
     max_unread_messages: int
+    max_retrieval_pages: int
     max_body_characters: int
     output_dir: Path
     apply_changes: bool = False
@@ -339,14 +372,19 @@ class Settings:
         tenant_id = os.getenv("MS_TENANT_ID", "").strip()
         client_id = os.getenv("MS_CLIENT_ID", "").strip()
         requested_source = (source or os.getenv("TRIAGE_SOURCE", "")).strip().lower()
-        if requested_source and requested_source not in {"graph", "local", "owa"}:
-            raise ConfigurationError("TRIAGE_SOURCE must be graph, local, or owa")
+        allowed_sources = {"graph", "local", "owa", "desktop", "accessibility"}
+        if requested_source and requested_source not in allowed_sources:
+            raise ConfigurationError(
+                "TRIAGE_SOURCE must be graph, local, owa, desktop, or accessibility"
+            )
         if requested_source:
             mailbox_source = requested_source
         elif resolved_input:
             mailbox_source = "local"
         else:
-            mailbox_source = "graph"
+            # Browser-session Outlook is the credential-free default. Graph is
+            # selected automatically only when both app-registration values exist.
+            mailbox_source = "graph" if tenant_id and client_id else "owa"
         if mailbox_source == "local" and not resolved_input:
             raise ConfigurationError(
                 "Local source needs --input or TRIAGE_INPUT pointing at JSONL/JSON/.eml files."
@@ -406,11 +444,24 @@ class Settings:
                 "with --input. Use --owa --apply for Outlook in Edge, or drop --apply "
                 "to preview a local file."
             )
+        if apply_enabled and mailbox_source in {"desktop", "accessibility"}:
+            raise ConfigurationError(
+                "The macOS Outlook desktop adapter is read-only and cannot be combined "
+                "with --apply. Use Graph or --owa for policy-approved mailbox writes."
+            )
+        if mark_read_enabled and mailbox_source in {"desktop", "accessibility"}:
+            raise ConfigurationError(
+                "The macOS Outlook desktop adapter cannot mark messages read."
+            )
         owa_cdp_url = (
             os.getenv("EDGE_CDP_URL", "").strip()
             or os.getenv("OWA_CDP_URL", "").strip()
             or "http://127.0.0.1:9222"
         )
+        if mailbox_source == "owa" and not _is_loopback_http_url(owa_cdp_url):
+            raise ConfigurationError(
+                "EDGE_CDP_URL must be an HTTP loopback endpoint with an explicit port"
+            )
 
         return cls(
             tenant_id=tenant_id,
@@ -426,12 +477,523 @@ class Settings:
             input_path=Path(resolved_input).expanduser() if resolved_input else None,
             owa_cdp_url=owa_cdp_url.rstrip("/"),
             max_unread_messages=_positive_int("MAX_UNREAD_MESSAGES", 20),
+            max_retrieval_pages=_positive_int("MAX_RETRIEVAL_PAGES", 10),
             max_body_characters=_positive_int("MAX_BODY_CHARACTERS", 12_000),
             output_dir=Path(os.getenv("TRIAGE_OUTPUT_DIR", "var")).expanduser(),
             apply_changes=apply_enabled,
             mark_read=mark_read_enabled,
             use_agent=agent_enabled,
         )
+
+
+# -------------------------------------------------------------------------
+# email_triage/backends.py
+# -------------------------------------------------------------------------
+
+"""Explicit, metadata-only mailbox capability reporting."""
+
+
+
+
+@dataclass(frozen=True)
+class BackendCapabilities:
+    source: str
+    authentication: str
+    read_scope: str
+    supports_apply: bool
+    supports_incremental_scan: bool
+    metadata_prefilter: bool
+    bulk_body_export: bool = False
+    attachment_content: bool = False
+    send_mail: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+CAPABILITIES = {
+    "graph": BackendCapabilities(
+        "graph", "delegated_oauth", "unread_inbox", True, True, True
+    ),
+    "owa": BackendCapabilities(
+        "owa", "existing_edge_session", "unread_inbox", True, True, True
+    ),
+    "local": BackendCapabilities(
+        "local", "none", "user_selected_files", False, False, False
+    ),
+    "desktop": BackendCapabilities(
+        "desktop",
+        "macos_accessibility",
+        "frontmost_outlook_message_only",
+        False,
+        False,
+        False,
+    ),
+    "accessibility": BackendCapabilities(
+        "accessibility",
+        "macos_accessibility",
+        "visible_unread_inbox_rows",
+        False,
+        False,
+        True,
+    ),
+}
+
+
+def backend_capabilities(source: str) -> BackendCapabilities:
+    return CAPABILITIES[source]
+
+
+# -------------------------------------------------------------------------
+# email_triage/desktop.py
+# -------------------------------------------------------------------------
+
+"""Read one user-selected, frontmost Outlook message through macOS Accessibility.
+
+This optional adapter cannot enumerate a mailbox, read attachments, or mutate mail.
+"""
+
+
+
+
+
+_VISIBLE_MESSAGE_SCRIPT = r'''
+tell application "System Events"
+    if not (exists process "Microsoft Outlook") then error "outlook_not_running"
+    tell process "Microsoft Outlook"
+        if not (exists front window) then error "outlook_has_no_window"
+        return name of front window
+    end tell
+end tell
+'''
+
+_FRONT_WINDOW_PROBE_SCRIPT = r'''
+tell application "System Events"
+    if not (exists process "Microsoft Outlook") then error "outlook_not_running"
+    tell process "Microsoft Outlook"
+        if not (exists front window) then error "outlook_has_no_window"
+    end tell
+end tell
+return "ready"
+'''
+
+
+@dataclass(frozen=True)
+class DesktopDiagnostic:
+    available: bool
+    code: str
+    detail: str
+
+    def to_dict(self) -> dict[str, str | bool]:
+        return {"available": self.available, "code": self.code, "detail": self.detail}
+
+
+Runner = Callable[..., subprocess.CompletedProcess[str]]
+
+
+def desktop_diagnostic(runner: Runner = subprocess.run) -> DesktopDiagnostic:
+    if platform.system() != "Darwin":
+        return DesktopDiagnostic(False, "unsupported_platform", "Requires macOS.")
+    if shutil.which("osascript") is None:
+        return DesktopDiagnostic(False, "osascript_missing", "macOS osascript was not found.")
+    probe = runner(
+        ["osascript", "-e", 'tell application "System Events" to exists process "Microsoft Outlook"'],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    if probe.returncode != 0:
+        return DesktopDiagnostic(
+            False,
+            "accessibility_denied",
+            "Allow the invoking app under System Settings > Privacy & Security > Accessibility.",
+        )
+    if probe.stdout.strip().lower() != "true":
+        return DesktopDiagnostic(False, "outlook_not_running", "Open Microsoft Outlook first.")
+    return DesktopDiagnostic(
+        True,
+        "ready",
+        "Reads only visible text from Outlook's single frontmost message window.",
+    )
+
+
+class OutlookDesktopMailbox:
+    """Read-only adapter for the one message explicitly opened by the user."""
+
+    def __init__(self, runner: Runner = subprocess.run):
+        self._runner = runner
+
+    def unread_messages(
+        self, limit: int, exclude_ids: set[str] | None = None
+    ) -> list[GraphMessage]:
+        if limit < 1:
+            return []
+        diagnostic = desktop_diagnostic(self._runner)
+        if not diagnostic.available:
+            raise ConfigurationError(f"Outlook desktop adapter: {diagnostic.detail}")
+        result = self._runner(
+            ["osascript", "-e", _VISIBLE_MESSAGE_SCRIPT],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise ConfigurationError(
+                "Could not read Outlook's front window through Accessibility. Open one "
+                "message in its own frontmost window and verify Accessibility permission."
+            )
+        lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        if not lines:
+            raise ConfigurationError(
+                "Outlook's front window did not expose a message title. Open one "
+                "message in its own window and retry."
+            )
+        subject, body = lines[0], ""
+        message_id = "outlook-desktop-" + hashlib.sha256(
+            result.stdout.encode("utf-8")
+        ).hexdigest()[:24]
+        if exclude_ids and message_id in exclude_ids:
+            return []
+        return [
+            GraphMessage(
+                id=message_id,
+                internet_message_id=None,
+                subject=subject,
+                sender_name="",
+                sender_address="",
+                received_at=None,
+                body=body,
+                sensitivity="normal",
+                has_attachments=False,
+                odata_type="",
+            )
+        ]
+
+    def probe_access(self) -> None:
+        """Validate front-window Accessibility without reading visible message text."""
+
+        diagnostic = desktop_diagnostic(self._runner)
+        if not diagnostic.available:
+            raise ConfigurationError(f"Outlook desktop adapter: {diagnostic.detail}")
+        result = self._runner(
+            ["osascript", "-e", _FRONT_WINDOW_PROBE_SCRIPT],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if result.returncode != 0 or result.stdout.strip().lower() != "ready":
+            raise ConfigurationError(
+                "Outlook desktop adapter could not verify a frontmost window."
+            )
+
+
+# -------------------------------------------------------------------------
+# email_triage/accessibility.py
+# -------------------------------------------------------------------------
+
+"""Read the currently visible, unread rows from an already-open Outlook window.
+
+This adapter is deliberately narrow.  Its visible-row parsing
+approach is adapted from the MIT-licensed reader in
+https://github.com/Arkya-AI/outlook-email-scanner (MIT License).  It does not
+activate Outlook, select rows, navigate, scroll, open attachments, export data, or mutate
+mail.  ``atomacos`` is imported only when this backend is used, so the package
+continues to work on non-macOS systems without optional dependencies.
+"""
+
+
+
+
+
+def _get(value: Any, *names: str) -> Any:
+    """Read an AX attribute from either a fake or an atomacos element."""
+    for name in names:
+        try:
+            if hasattr(value, "getAttribute"):
+                result = value.getAttribute(name)
+            elif isinstance(value, dict):
+                result = value.get(name)
+            else:
+                result = getattr(value, name, None)
+        except Exception:
+            result = None
+        if result not in (None, "", []):
+            return result
+    return None
+
+
+def _children(value: Any) -> list[Any]:
+    result = _get(value, "AXChildren", "children")
+    if result is None:
+        try:
+            result = value.children()
+        except Exception:
+            result = []
+    return list(result or [])
+
+
+def _walk(value: Any, *, seen: set[int] | None = None):
+    seen = set() if seen is None else seen
+    if id(value) in seen:
+        return
+    seen.add(id(value))
+    yield value
+    for child in _children(value):
+        yield from _walk(child, seen=seen)
+
+
+def _text(value: Any) -> str:
+    raw = _get(value, "AXValue", "AXTitle", "AXDescription", "value", "title")
+    if isinstance(raw, (str, int, float)):
+        return str(raw).strip()
+    return ""
+
+
+def _role(value: Any) -> str:
+    return str(_get(value, "AXRole", "role") or "").lower()
+
+
+def _explicitly_unread(row: Any) -> bool:
+    """Require a real AX unread marker; never infer unread from row styling."""
+    for element in _walk(row):
+        role = _role(element)
+        for attribute in ("AXDescription", "AXTitle", "AXValue", "AXIdentifier"):
+            marker = str(_get(element, attribute) or "").strip().lower()
+            if not marker:
+                continue
+            if marker in {"unread", "read: false", "is unread", "unread message"}:
+                return True
+            if marker in {"•", "●", "⬤"}:
+                return True
+            if "unread" in marker and role in {"aximage", "axcheckbox", "axstatictext", "axbutton", ""}:
+                return True
+    return False
+
+
+def _rows(table: Any) -> list[Any]:
+    rows = _get(table, "AXVisibleRows")
+    if rows is None:
+        rows = _get(table, "AXRows")
+    if rows is None:
+        rows = [child for child in _children(table) if _role(child) in {"axrow", "row"}]
+    return list(rows or [])
+
+
+def _find_table(window: Any) -> Any | None:
+    for element in _walk(window):
+        if _role(element) in {"axtable", "table"} and _rows(element):
+            return element
+    return None
+
+
+def _find_inbox_window(app: Any) -> Any | None:
+    try:
+        windows = list(app.windows())
+    except Exception as exc:
+        raise ConfigurationError(
+            "Could not inspect Outlook windows through Accessibility; ensure Outlook "
+            "is already open and Accessibility permission is granted."
+        ) from exc
+    for window in windows:
+        title = str(_get(window, "AXTitle", "AXDescription", "title") or "").lower()
+        if "inbox" in title and _find_table(window) is not None:
+            return window
+    return None
+
+
+def _reading_pane(window: Any, table: Any) -> Any:
+    # Prefer an explicitly named pane.  Otherwise use the window: AX values
+    # are restricted to the already-visible tree and never trigger navigation.
+    for element in _walk(window):
+        label = str(_get(element, "AXTitle", "AXDescription", "AXIdentifier") or "").lower()
+        if "reading" in label or "message body" in label:
+            return element
+    return window
+
+
+def _outlook_content_group(window: Any) -> Any:
+    """Follow Outlook 16.x split groups, with the window as safe fallback."""
+
+    current = window
+    for position in (0, -1, -1):
+        split_groups = [item for item in _children(current) if _role(item) == "axsplitgroup"]
+        if not split_groups:
+            return window
+        try:
+            current = split_groups[position]
+        except IndexError:
+            return window
+    return current
+
+
+def _first_role(root: Any, role: str) -> Any | None:
+    expected = role.lower()
+    return next((item for item in _walk(root) if _role(item) == expected), None)
+
+
+def _header_and_body(window: Any) -> tuple[Any, Any]:
+    content = _outlook_content_group(window)
+    children = _children(content)
+    header = children[2] if len(children) > 2 else _reading_pane(window, content)
+    body_group = children[4] if len(children) > 4 else content
+    body = _first_role(body_group, "axwebarea") or body_group
+    return header, body
+
+
+def _sender_parts(raw: str) -> tuple[str, str]:
+    match = re.search(r"<([^<>\s]+@[^<>\s]+)>", raw)
+    if match:
+        return raw[: match.start()].strip().strip('"'), match.group(1)
+    email = re.search(r"[\w.+-]+@[\w.-]+", raw)
+    return (raw, email.group(0)) if email else (raw, "")
+
+
+def accessibility_diagnostic(atomacos_module: Any | None = None) -> DesktopDiagnostic:
+    """Check platform, optional bridge, and Inbox tree without reading mail text."""
+
+    if platform.system() != "Darwin":
+        return DesktopDiagnostic(
+            False, "unsupported_platform", "Accessibility scanning requires macOS."
+        )
+    try:
+        module = atomacos_module or importlib.import_module("atomacos")
+    except (ImportError, OSError):
+        return DesktopDiagnostic(
+            False,
+            "dependency_missing",
+            "The experimental Accessibility source needs a separate atomacos install.",
+        )
+    try:
+        app = module.getAppRefByBundleId("com.microsoft.Outlook")
+        available = _find_inbox_window(app) is not None
+    except ConfigurationError:
+        available = False
+    except Exception:
+        available = False
+    return DesktopDiagnostic(
+        available,
+        "ready" if available else "outlook_inbox_unavailable",
+        (
+            "An already-open Outlook Inbox table is available; no row text was read."
+            if available
+            else "Open Outlook to its Inbox and grant Accessibility permission."
+        ),
+    )
+
+
+def _read_field(pane: Any, names: tuple[str, ...]) -> str:
+    for element in _walk(pane):
+        value = _get(element, *names)
+        if isinstance(value, (str, int, float)) and str(value).strip():
+            return str(value).strip()
+    return ""
+
+
+def _visible_text(pane: Any) -> list[str]:
+    values: list[str] = []
+    for element in _walk(pane):
+        text = _text(element)
+        if text and text not in values:
+            values.append(text)
+    return values
+
+
+class OutlookAccessibilityMailbox:
+    """Read-only mailbox view backed by the existing Outlook AX hierarchy."""
+
+    def __init__(
+        self,
+        atomacos_module: Any | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self._atomacos = atomacos_module
+        self._sleep = sleep
+
+    def _module(self) -> Any:
+        if self._atomacos is not None:
+            return self._atomacos
+        try:
+            self._atomacos = importlib.import_module("atomacos")
+        except (ImportError, OSError) as exc:
+            raise ConfigurationError(
+                "Outlook Accessibility requires optional 'atomacos' on macOS; "
+                "install it, open Outlook to its Inbox, and grant Accessibility permission."
+            ) from exc
+        return self._atomacos
+
+    def _app(self) -> Any:
+        module = self._module()
+        try:
+            return module.getAppRefByBundleId("com.microsoft.Outlook")
+        except Exception as exc:
+            raise ConfigurationError(
+                "Could not connect to the already-open Microsoft Outlook app through "
+                "Accessibility; open Outlook and grant Accessibility permission."
+            ) from exc
+
+    def unread_messages(self, limit: int, exclude_ids: set[str] | None = None) -> list[GraphMessage]:
+        if limit < 1:
+            return []
+        exclude_ids = exclude_ids or set()
+        window = _find_inbox_window(self._app())
+        if window is None:
+            raise ConfigurationError(
+                "No already-open Outlook Inbox window with a visible message table was found; "
+                "open Inbox without scrolling and retry."
+            )
+        table = _find_table(window)
+        assert table is not None
+        messages: list[GraphMessage] = []
+        for row in _rows(table):
+            if len(messages) >= limit or not _explicitly_unread(row):
+                continue
+            # Read only the already-exposed row subtree. Selecting a row can
+            # trigger Outlook's "mark as read on selection" preference, so this
+            # fallback intentionally limits content to visible row metadata.
+            header = row
+            body_element = row
+            header_values = _visible_text(row)
+            subject = (
+                _read_field(header, ("AXSubject", "subject"))
+                or (header_values[0] if header_values else _text(row))
+            )
+            sender_raw = _read_field(header, ("AXSender", "sender")) or (
+                header_values[1] if len(header_values) > 1 else ""
+            )
+            sender_name = _read_field(header, ("AXSenderName", "sender_name"))
+            sender_address = _read_field(
+                header, ("AXSenderAddress", "sender_address")
+            )
+            parsed_name, parsed_address = _sender_parts(sender_raw)
+            sender_name = sender_name or parsed_name
+            sender_address = sender_address or parsed_address
+            body = _read_field(body_element, ("AXBody", "body"))
+            if not body:
+                body = "\n".join(
+                    item for item in _visible_text(body_element) if item and item != "\xa0"
+                )
+            received = _read_field(header, ("AXReceivedAt", "received_at"))
+            message_key = "\x1f".join((subject, sender_address, received, body))
+            message_id = "outlook-ax-" + hashlib.sha256(message_key.encode()).hexdigest()[:24]
+            if message_id in exclude_ids:
+                continue
+            received_at = None
+            if received:
+                try:
+                    received_at = datetime.fromisoformat(received.replace("Z", "+00:00"))
+                except ValueError:
+                    pass
+            messages.append(GraphMessage(
+                id=message_id, subject=subject, sender_name=sender_name,
+                sender_address=sender_address, received_at=received_at, body=body,
+            ))
+        return messages
+
+
+AccessibilityMailbox = OutlookAccessibilityMailbox
 
 
 # -------------------------------------------------------------------------
@@ -818,6 +1380,25 @@ def _manual_review(reason: ManualReviewReason, processing_error: bool = False) -
     )
 
 
+def _no_reply_sender_result() -> ScreeningResult:
+    """Deterministic metadata-only result for automated sender addresses."""
+
+    return ScreeningResult(
+        summary="Automated sender address does not accept replies.",
+        priority_score=1,
+        action_items=(),
+        route=Route.NO_REPLY,
+        response_required=False,
+        confidence=Confidence.HIGH,
+        urgency=Urgency.ROUTINE,
+        deadline=None,
+        topic=Topic.OTHER,
+        manual_review_reason=None,
+        rationale="No-reply sender; file without body analysis.",
+        suggested_reply=None,
+    )
+
+
 def enforce_route(result: ScreeningResult, no_reply_sender: bool) -> ScreeningResult:
     """Apply deterministic routing after schema validation."""
 
@@ -863,6 +1444,8 @@ def process_message(
     processing_error: str | None = None
     if local_reason is not None:
         result = _manual_review(local_reason)
+    elif message.is_no_reply_sender:
+        result = _no_reply_sender_result()
     else:
         try:
             result = classifier.classify(body, message.has_attachments)
@@ -920,6 +1503,12 @@ class LocalQueue:
 
     def contains(self, message_id: str) -> bool:
         return message_id in self._seen
+
+    @property
+    def seen_ids(self) -> set[str]:
+        """Copy IDs for metadata-stage exclusion during incremental scans."""
+
+        return set(self._seen)
 
     def append(self, record: ReviewRecord) -> None:
         self._prepare()
@@ -1356,273 +1945,289 @@ class DeterministicSortingAgent:
 
 GRAPH_ROOT = "https://graph.microsoft.com/v1.0"
 READ_SCOPES = "openid offline_access https://graph.microsoft.com/Mail.Read"
-#: Mail.ReadWrite covers folders, categories, and draft creation. Mail.Send is never
-#: requested, so this application cannot send mail even if it were asked to.
 READ_WRITE_SCOPES = "openid offline_access https://graph.microsoft.com/Mail.ReadWrite"
 
 
 class GraphError(RuntimeError):
-    """Raised when Microsoft Graph authentication or retrieval fails."""
+    """A Microsoft Graph failure with machine-readable context."""
+
+    def __init__(self, message: str, *, status: int | None = None, code: str | None = None,
+                 operation: str | None = None, retryable: bool = False, detail: str | None = None) -> None:
+        super().__init__(message)
+        self.status, self.code, self.operation = status, code, operation
+        self.retryable, self.detail = retryable, detail
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "code": self.code or "graph_error",
+            "status": self.status,
+            "operation": self.operation,
+            "retryable": self.retryable,
+            "message": str(self),
+        }
 
 
 class GraphMailbox:
-    def __init__(
-        self,
-        tenant_id: str,
-        client_id: str,
-        cache_path: Path,
-        read_write: bool = False,
-        interactive: bool = True,
-    ):
-        self.tenant_id = tenant_id
-        self.client_id = client_id
-        self.cache_path = cache_path
+    def __init__(self, tenant_id: str, client_id: str, cache_path: Path, read_write: bool = False,
+                 interactive: bool = True, *, max_scan_pages: int = 10) -> None:
+        if max_scan_pages < 1:
+            raise ValueError("max_scan_pages must be positive")
+        self.tenant_id, self.client_id, self.cache_path = tenant_id, client_id, cache_path
         self.scopes = READ_WRITE_SCOPES if read_write else READ_SCOPES
-        #: Scheduled runs set this False so a run never blocks on a device-code prompt.
-        self.interactive = interactive
+        self.interactive, self.max_scan_pages = interactive, max_scan_pages
         self._folder_ids: dict[str, str] = {}
 
     def _token_url(self, path: str) -> str:
         return f"https://login.microsoftonline.com/{self.tenant_id}/oauth2/v2.0/{path}"
 
     def _post_form(self, url: str, values: dict[str, str]) -> dict[str, Any]:
-        request = Request(
-            url,
-            data=urlencode(values).encode("ascii"),
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            method="POST",
-        )
+        request = Request(url, data=urlencode(values).encode("ascii"),
+                          headers={"Content-Type": "application/x-www-form-urlencoded"}, method="POST")
         try:
             with urlopen(request, timeout=30) as response:
                 return json.load(response)
         except HTTPError as exc:
-            try:
-                payload = json.loads(exc.read().decode("utf-8"))
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                payload = {}
+            try: payload = json.loads(exc.read().decode("utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError): payload = {}
             payload.setdefault("error", f"http_{exc.code}")
             return payload
         except (URLError, TimeoutError, json.JSONDecodeError) as exc:
-            raise GraphError("Microsoft authentication endpoint was unavailable") from exc
+            raise GraphError("Microsoft authentication endpoint was unavailable", operation="token") from exc
 
     def _load_cache(self) -> dict[str, Any]:
-        if not self.cache_path.exists():
-            return {}
-        try:
-            return json.loads(self.cache_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return {}
+        if not self.cache_path.exists(): return {}
+        try: return json.loads(self.cache_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError): return {}
 
     def _save_cache(self, token: dict[str, Any]) -> None:
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
         os.chmod(self.cache_path.parent, 0o700)
-        cached = {
-            "access_token": token.get("access_token"),
-            "refresh_token": token.get("refresh_token"),
-            "expires_at": int(time.time()) + int(token.get("expires_in", 0)),
-            "scopes": self.scopes,
-        }
+        cached = {"access_token": token.get("access_token"), "refresh_token": token.get("refresh_token"),
+                  "expires_at": int(time.time()) + int(token.get("expires_in", 0)), "scopes": self.scopes}
         self.cache_path.write_text(json.dumps(cached), encoding="utf-8")
         os.chmod(self.cache_path, 0o600)
 
-    def access_token(self) -> str:
+    def _refresh_access_token(
+        self,
+        cached: dict[str, Any] | None = None,
+        *,
+        persist: bool = True,
+    ) -> str | None:
+        cached = cached or self._load_cache(); refresh_token = cached.get("refresh_token")
+        if not refresh_token: return None
+        refreshed = self._post_form(self._token_url("token"), {"client_id": self.client_id,
+            "grant_type": "refresh_token", "refresh_token": str(refresh_token), "scope": self.scopes})
+        if not refreshed.get("access_token"): return None
+        refreshed.setdefault("refresh_token", refresh_token)
+        if persist:
+            self._save_cache(refreshed)
+        return str(refreshed["access_token"])
+
+    def access_token(self, *, persist: bool = True) -> str:
         cached = self._load_cache()
-        # A cached token issued for narrower scopes cannot authorize write calls.
-        if cached.get("scopes", READ_SCOPES) != self.scopes:
-            cached = {}
+        if cached.get("scopes", READ_SCOPES) != self.scopes: cached = {}
         if cached.get("access_token") and int(cached.get("expires_at", 0)) > time.time() + 120:
             return str(cached["access_token"])
-        if cached.get("refresh_token"):
-            refreshed = self._post_form(
-                self._token_url("token"),
-                {
-                    "client_id": self.client_id,
-                    "grant_type": "refresh_token",
-                    "refresh_token": str(cached["refresh_token"]),
-                    "scope": self.scopes,
-                },
-            )
-            if refreshed.get("access_token"):
-                refreshed.setdefault("refresh_token", cached["refresh_token"])
-                self._save_cache(refreshed)
-                return str(refreshed["access_token"])
-
+        refreshed = self._refresh_access_token(cached, persist=persist)
+        if refreshed: return refreshed
         if not self.interactive:
-            raise GraphError(
-                "No usable cached Microsoft credential. Sign in once from a terminal with "
-                "`email-triage --login` (add --apply for read-write scope); scheduled runs "
-                "then refresh silently."
-            )
-
-        flow = self._post_form(
-            self._token_url("devicecode"),
-            {"client_id": self.client_id, "scope": self.scopes},
-        )
-        if "device_code" not in flow:
-            raise GraphError("Microsoft device authorization could not be started")
-        print(flow.get("message", "Complete the Microsoft device-code sign-in."))
-        interval = max(int(flow.get("interval", 5)), 1)
-        deadline = time.time() + int(flow.get("expires_in", 900))
+            raise GraphError("No usable cached Microsoft credential. Sign in once from terminal with "
+                             "`email-triage --login` (add --apply read-write scope); scheduled runs then silently.", code="authentication_required", operation="token")
+        flow = self._post_form(self._token_url("devicecode"), {"client_id": self.client_id, "scope": self.scopes})
+        if "device_code" not in flow: raise GraphError("Microsoft device authorization could not be started", operation="devicecode")
+        print(flow.get("message", "Complete Microsoft device-code sign-in."))
+        interval = max(int(flow.get("interval", 5)), 1); deadline = time.time() + int(flow.get("expires_in", 900))
         while time.time() < deadline:
-            token = self._post_form(
-                self._token_url("token"),
-                {
-                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-                    "client_id": self.client_id,
-                    "device_code": str(flow["device_code"]),
-                },
-            )
+            token = self._post_form(self._token_url("token"), {"grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                                                                  "client_id": self.client_id, "device_code": str(flow["device_code"])})
             if token.get("access_token"):
-                self._save_cache(token)
+                if persist:
+                    self._save_cache(token)
                 return str(token["access_token"])
             error = token.get("error")
             if error not in {"authorization_pending", "slow_down"}:
-                raise GraphError(f"Microsoft authentication failed: {error or 'unknown_error'}")
-            if error == "slow_down":
-                interval += 5
+                raise GraphError(f"Microsoft authentication failed: {error or 'unknown_error'}", operation="devicecode", code=error)
+            if error == "slow_down": interval += 5
             time.sleep(interval)
-        raise GraphError("Microsoft device authorization expired before completion")
+        raise GraphError("Microsoft device authorization expired before completion", operation="devicecode")
 
-    def unread_messages(self, limit: int) -> list[GraphMessage]:
-        token = self.access_token()
-        query = urlencode(
-            {
-                "$filter": "isRead eq false",
-                "$top": str(min(limit, 50)),
-                "$select": (
-                    "id,internetMessageId,subject,from,receivedDateTime,body,"
-                    "sensitivity,hasAttachments,isRead"
-                ),
-            }
-        )
+    @staticmethod
+    def _validated_next_link(url: str) -> str:
+        parsed = urlparse(url)
+        if parsed.scheme != "https" or parsed.netloc != "graph.microsoft.com":
+            raise GraphError("Microsoft Graph returned an unsafe pagination link", code="unsafe_next_link", operation="pagination")
+        return url
+
+    def _request_json(self, request: Request, *, token: str, operation: str) -> tuple[dict[str, Any], str]:
+        try:
+            with urlopen(request, timeout=30) as response: return json.load(response), token
+        except HTTPError as exc:
+            if exc.code == 401:
+                refreshed = self._refresh_access_token()
+                if refreshed:
+                    retry = Request(
+                        request.full_url,
+                        headers=dict(request.headers),
+                        method=request.get_method(),
+                    )
+                    retry.add_header("Authorization", f"Bearer {refreshed}")
+                    try:
+                        with urlopen(retry, timeout=30) as response: return json.load(response), refreshed
+                    except HTTPError as retry_exc:
+                        detail = retry_exc.read().decode("utf-8", errors="replace")[:400]
+                        raise GraphError(f"Microsoft Graph returned HTTP {retry_exc.code}; verify delegated Mail.Read consent",
+                                         status=retry_exc.code, operation=operation, detail=detail) from retry_exc
+                    except (URLError, TimeoutError, json.JSONDecodeError) as retry_exc:
+                        raise GraphError(
+                            "Microsoft Graph retry failed",
+                            code="retry_transport_error",
+                            operation=operation,
+                            retryable=True,
+                        ) from retry_exc
+            detail = exc.read().decode("utf-8", errors="replace")[:400]
+            raise GraphError(f"Microsoft Graph returned HTTP {exc.code}; verify delegated Mail.Read consent",
+                             status=exc.code, operation=operation, retryable=exc.code >= 500, detail=detail) from exc
+        except (URLError, TimeoutError, json.JSONDecodeError) as exc:
+            raise GraphError("Microsoft Graph message retrieval failed", operation=operation, retryable=True) from exc
+
+    def unread_messages(self, limit: int, exclude_ids: set[str] | None = None) -> list[GraphMessage]:
+        if limit <= 0: return []
+        excluded = exclude_ids or set(); token = self.access_token()
+        query = urlencode({"$filter": "isRead eq false", "$top": str(min(max(limit, 1), 50)),
+                           "$select": "id,internetMessageId,subject,from,receivedDateTime,sensitivity,hasAttachments,isRead,@odata.type"})
         url: str | None = f"{GRAPH_ROOT}/me/mailFolders/inbox/messages?{query}"
-        messages: list[GraphMessage] = []
+        messages: list[GraphMessage] = []; pages = 0
         while url and len(messages) < limit:
-            request = Request(
-                url,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Accept": "application/json",
-                    "Prefer": 'outlook.body-content-type="text"',
-                },
-            )
-            try:
-                with urlopen(request, timeout=30) as response:
-                    payload = json.load(response)
-            except HTTPError as exc:
-                raise GraphError(
-                    f"Microsoft Graph returned HTTP {exc.code}; verify delegated Mail.Read consent"
-                ) from exc
-            except (URLError, TimeoutError, json.JSONDecodeError) as exc:
-                raise GraphError("Microsoft Graph message retrieval failed") from exc
+            pages += 1
+            if pages > self.max_scan_pages: raise GraphError("Microsoft Graph scan exceeded max_scan_pages", code="scan_limit", operation="pagination")
+            request = Request(url, headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
+            payload, token = self._request_json(request, token=token, operation="list_messages")
             for raw in payload.get("value", []):
-                messages.append(_parse_message(raw))
-                if len(messages) >= limit:
-                    break
-            url = payload.get("@odata.nextLink")
+                item_id = str(raw.get("id", "")); odata_type = str(raw.get("@odata.type", "")).lower()
+                if not item_id or item_id in excluded or "event" in odata_type or "calendar" in odata_type: continue
+                detail_query = urlencode({"$select": "id,internetMessageId,subject,from,receivedDateTime,body,sensitivity,hasAttachments,isRead,@odata.type"})
+                detail_request = Request(f"{GRAPH_ROOT}/me/messages/{quote(item_id, safe='')}?{detail_query}",
+                    headers={"Authorization": f"Bearer {token}", "Accept": "application/json", "Prefer": 'outlook.body-content-type="text"'})
+                detailed, token = self._request_json(detail_request, token=token, operation="get_message")
+                messages.append(_parse_message(detailed))
+                if len(messages) >= limit: break
+            next_link = payload.get("@odata.nextLink")
+            url = self._validated_next_link(str(next_link)) if next_link else None
         return messages
 
-    # --- write operations (require read_write=True) -------------------------------
+    def probe_access(self) -> None:
+        """Validate read access without parsing or retaining the response body."""
 
-    def _json_request(
-        self,
-        method: str,
-        path: str,
-        payload: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        if self.scopes != READ_WRITE_SCOPES:
-            raise GraphError("write operations require a read-write Graph session")
+        token = self.access_token(persist=False)
+        query = urlencode({"$top": "1", "$select": "id"})
         request = Request(
-            f"{GRAPH_ROOT}{path}",
-            data=json.dumps(payload).encode("utf-8") if payload is not None else None,
-            headers={
-                "Authorization": f"Bearer {self.access_token()}",
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-            },
-            method=method,
+            f"{GRAPH_ROOT}/me/mailFolders/inbox/messages?{query}",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
         )
         try:
-            with urlopen(request, timeout=30) as response:
-                body = response.read()
-                return json.loads(body) if body else {}
+            with urlopen(request, timeout=30):
+                return
         except HTTPError as exc:
+            if exc.code == 401:
+                refreshed = self._refresh_access_token(persist=False)
+                if refreshed:
+                    retry = Request(
+                        request.full_url,
+                        headers={
+                            "Authorization": f"Bearer {refreshed}",
+                            "Accept": "application/json",
+                        },
+                    )
+                    try:
+                        with urlopen(retry, timeout=30):
+                            return
+                    except HTTPError as retry_exc:
+                        raise GraphError(
+                            "Microsoft Graph live probe was denied",
+                            status=retry_exc.code,
+                            code="probe_denied",
+                            operation="live_probe",
+                            retryable=retry_exc.code >= 500,
+                        ) from retry_exc
+                    except (URLError, TimeoutError) as retry_exc:
+                        raise GraphError(
+                            "Microsoft Graph live probe transport failed",
+                            code="probe_transport_error",
+                            operation="live_probe",
+                            retryable=True,
+                        ) from retry_exc
+            raise GraphError(
+                "Microsoft Graph live probe was denied",
+                status=exc.code,
+                code="probe_denied",
+                operation="live_probe",
+                retryable=exc.code >= 500,
+            ) from exc
+        except (URLError, TimeoutError) as exc:
+            raise GraphError(
+                "Microsoft Graph live probe transport failed",
+                code="probe_transport_error",
+                operation="live_probe",
+                retryable=True,
+            ) from exc
+
+    def _json_request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        if self.scopes != READ_WRITE_SCOPES: raise GraphError("write operations require a read-write Graph session", operation=method)
+        body = json.dumps(payload).encode("utf-8") if payload is not None else None
+        token = self.access_token()
+        request = Request(f"{GRAPH_ROOT}{path}", data=body,
+                          headers={"Authorization": f"Bearer {token}", "Accept": "application/json", "Content-Type": "application/json"}, method=method)
+        try:
+            with urlopen(request, timeout=30) as response:
+                raw = response.read(); return json.loads(raw) if raw else {}
+        except HTTPError as exc:
+            if exc.code == 401:
+                refreshed = self._refresh_access_token()
+                if refreshed:
+                    retry = Request(f"{GRAPH_ROOT}{path}", data=body,
+                                    headers={"Authorization": f"Bearer {refreshed}", "Accept": "application/json", "Content-Type": "application/json"}, method=method)
+                    try:
+                        with urlopen(retry, timeout=30) as response:
+                            raw = response.read(); return json.loads(raw) if raw else {}
+                    except HTTPError as retry_exc:
+                        detail = retry_exc.read().decode("utf-8", errors="replace")[:400]
+                        raise GraphError(f"Microsoft Graph {method} {path} failed ({retry_exc.code}): {detail}", status=retry_exc.code, operation=method, detail=detail) from retry_exc
             detail = exc.read().decode("utf-8", errors="replace")[:400]
-            raise GraphError(f"Microsoft Graph {method} {path} failed ({exc.code}): {detail}") from exc
+            raise GraphError(f"Microsoft Graph {method} {path} failed ({exc.code}): {detail}", status=exc.code, operation=method, detail=detail) from exc
         except (URLError, TimeoutError, json.JSONDecodeError) as exc:
-            raise GraphError(f"Microsoft Graph {method} {path} failed") from exc
+            raise GraphError(f"Microsoft Graph {method} {path} failed", operation=method, retryable=True) from exc
 
     def ensure_folder_path(self, folder_path: str) -> str:
-        """Create or reuse a nested mail folder such as 'AI Triage/Needs Reply'."""
-
-        if folder_path in self._folder_ids:
-            return self._folder_ids[folder_path]
-        parent = "inbox"
-        walked = ""
-        for segment in [part.strip() for part in folder_path.split("/") if part.strip()]:
-            walked = f"{walked}/{segment}" if walked else segment
-            cached = self._folder_ids.get(walked)
-            if cached:
-                parent = cached
-                continue
+        if folder_path in self._folder_ids: return self._folder_ids[folder_path]
+        parent, walked = "inbox", ""
+        for segment in (part.strip() for part in folder_path.split("/") if part.strip()):
+            walked = f"{walked}/{segment}" if walked else segment; cached = self._folder_ids.get(walked)
+            if cached: parent = cached; continue
             escaped = segment.replace("'", "''")
-            query = urlencode(
-                {"$filter": f"displayName eq '{escaped}'", "$select": "id,displayName", "$top": "10"}
-            )
-            found = self._json_request("GET", f"/me/mailFolders/{parent}/childFolders?{query}")
-            matches = [
-                item
-                for item in found.get("value", [])
-                if item.get("displayName") == segment and item.get("id")
-            ]
-            if matches:
-                folder_id = str(matches[0]["id"])
+            query = urlencode({"$filter": f"displayName eq '{escaped}'", "$select": "id,displayName", "$top": "10"})
+            found = self._json_request("GET", f"/me/mailFolders/{quote(parent, safe='')}/childFolders?{query}")
+            matches = [item for item in found.get("value", []) if item.get("displayName") == segment and item.get("id")]
+            if len(matches) > 1: raise GraphError(f"Multiple exact-match folders found for {segment!r}", code="ambiguous_folder", operation="ensure_folder_path")
+            if matches: folder_id = str(matches[0]["id"])
             else:
-                created = self._json_request(
-                    "POST",
-                    f"/me/mailFolders/{parent}/childFolders",
-                    {"displayName": segment},
-                )
+                created = self._json_request("POST", f"/me/mailFolders/{quote(parent, safe='')}/childFolders", {"displayName": segment})
                 folder_id = str(created.get("id") or "")
-                if not folder_id:
-                    raise GraphError(f"Microsoft Graph did not return an id for folder {segment!r}")
-            self._folder_ids[walked] = folder_id
-            parent = folder_id
+            if not folder_id: raise GraphError(f"Microsoft Graph did not return an id for folder {segment!r}", operation="ensure_folder_path")
+            self._folder_ids[walked] = folder_id; parent = folder_id
         return parent
 
-    def update_message(
-        self,
-        message_id: str,
-        categories: tuple[str, ...] | None = None,
-        is_read: bool | None = None,
-    ) -> None:
+    def update_message(self, message_id: str, categories: tuple[str, ...] | None = None, is_read: bool | None = None) -> None:
         payload: dict[str, Any] = {}
-        if categories is not None:
-            payload["categories"] = list(categories)
-        if is_read is not None:
-            payload["isRead"] = is_read
-        if not payload:
-            return
-        self._json_request("PATCH", f"/me/messages/{message_id}", payload)
+        if categories is not None: payload["categories"] = list(categories)
+        if is_read is not None: payload["isRead"] = is_read
+        if payload: self._json_request("PATCH", f"/me/messages/{quote(message_id, safe='')}", payload)
 
     def create_reply_draft(self, message_id: str, reply_text: str) -> str:
-        """Create an unsent reply draft. This never sends; no Mail.Send scope is held."""
-
-        draft = self._json_request(
-            "POST",
-            f"/me/messages/{message_id}/createReply",
-            {"comment": _text_to_html(reply_text)},
-        )
+        draft = self._json_request("POST", f"/me/messages/{quote(message_id, safe='')}/createReply", {"comment": _text_to_html(reply_text)})
         return str(draft.get("id") or "")
 
     def move_message(self, message_id: str, folder_id: str) -> str:
-        """Move a message and return its new identifier."""
-
-        moved = self._json_request(
-            "POST",
-            f"/me/messages/{message_id}/move",
-            {"destinationId": folder_id},
-        )
+        moved = self._json_request("POST", f"/me/messages/{quote(message_id, safe='')}/move", {"destinationId": folder_id})
         return str(moved.get("id") or message_id)
 
 
@@ -1632,226 +2237,391 @@ def _text_to_html(text: str) -> str:
 
 
 def _parse_message(raw: dict[str, Any]) -> GraphMessage:
-    sender = raw.get("from", {}).get("emailAddress", {})
-    received = raw.get("receivedDateTime")
-    return GraphMessage(
-        id=raw["id"],
-        internet_message_id=raw.get("internetMessageId"),
-        subject=raw.get("subject") or "",
-        sender_name=sender.get("name") or "",
-        sender_address=sender.get("address") or "",
+    sender = raw.get("from", {}).get("emailAddress", {}); received = raw.get("receivedDateTime")
+    return GraphMessage(id=raw["id"], internet_message_id=raw.get("internetMessageId"), subject=raw.get("subject") or "",
+        sender_name=sender.get("name") or "", sender_address=sender.get("address") or "",
         received_at=datetime.fromisoformat(received.replace("Z", "+00:00")) if received else None,
-        body=(raw.get("body") or {}).get("content") or "",
-        sensitivity=raw.get("sensitivity") or "normal",
-        has_attachments=bool(raw.get("hasAttachments")),
-        odata_type=raw.get("@odata.type") or "",
-    )
+        body=(raw.get("body") or {}).get("content") or "", sensitivity=raw.get("sensitivity") or "normal",
+        has_attachments=bool(raw.get("hasAttachments")), odata_type=raw.get("@odata.type") or "")
 
 
 # -------------------------------------------------------------------------
 # email_triage/owa.py
 # -------------------------------------------------------------------------
 
-"""Read and sort Outlook on the web from an already-open Microsoft Edge tab.
-
-This path exists because institutional Outlook often blocks third-party Graph
-apps, and Windows COM is unavailable on macOS. Outlook in Edge is already
-signed in as the first-party web client. The script attaches to that browser
-over Chrome DevTools Protocol, captures the session bearer token Outlook itself
-uses, then calls Microsoft Graph with that token. No Entra admin consent and no
-.eml export are required.
-
-Edge must be started once with remote debugging (user-level, no admin):
-
-    bash scripts/open_outlook_in_edge.sh
-
-Mail is never sent. Apply mode still only files, categorizes, and saves unsent drafts.
-"""
+"""Read an already-open Outlook on the web session through Edge CDP."""
 
 
 
-
-OWA_HOSTS = (
-    "outlook.office.com",
-    "outlook.office365.com",
-    "outlook.live.com",
-    "outlook.cloud.microsoft",
-)
+OWA_HOSTS = ("outlook.office.com", "outlook.office365.com", "outlook.live.com", "outlook.cloud.microsoft")
 OUTLOOK_REST_ROOT = "https://outlook.office.com/api/v2.0"
-EDGE_DEBUG_HELP = (
-    "No Microsoft Edge debugging port is open. Outlook on the web can be used "
-    "without Graph admin, but Edge must be started with remote debugging so this "
-    "script can reuse the already-signed-in tab. Quit Edge, then run: "
-    "bash scripts/open_outlook_in_edge.sh"
-)
+EDGE_DEBUG_HELP = ("No Microsoft Edge debugging port is open. Outlook on the web can be used "
+                   "without Graph admin, but Edge must be started with remote debugging so "
+                   "this script can reuse a normal signed-in tab. Run: "
+                   "bash scripts/open_outlook_in_edge.sh")
+
+
+@dataclass(frozen=True)
+class CapturedCookie:
+    name: str
+    value: str = field(repr=False)
+    domain: str
 
 
 @dataclass(frozen=True)
 class CapturedAuth:
-    token: str
+    token: str = field(repr=False)
     api_root: str = GRAPH_ROOT
+    anchor_mailbox: str = field(default="", repr=False)
+    cookies: tuple[CapturedCookie, ...] = field(default=(), repr=False)
+
+
+def _outlook_cookie_domain(domain: str) -> bool:
+    normalized = domain.lower().lstrip(".")
+    return normalized == "outlook.office.com" or normalized.endswith(
+        ".outlook.office.com"
+    )
+
+
+def _safe_cookie(cookie: CapturedCookie) -> bool:
+    """Allow only cookie material that cannot inject another HTTP header."""
+    if not cookie.name or any(character in cookie.name for character in "=;\r\n\0"):
+        return False
+    return not any(character in cookie.value for character in "\r\n\0")
+
+
+def _capture_cookies(page: Any) -> tuple[CapturedCookie, ...]:
+    try:
+        raw_cookies = page.context.cookies()
+    except Exception:
+        return ()
+    cookies: list[CapturedCookie] = []
+    for raw in raw_cookies:
+        name = str(raw.get("name", ""))
+        domain = str(raw.get("domain", ""))
+        if name and _outlook_cookie_domain(domain):
+            cookies.append(CapturedCookie(name, str(raw.get("value", "")), domain))
+    return tuple(cookies)
+
+
+def _anchor_from_token(token: str) -> str:
+    """Derive Outlook's PUID anchor in memory; never log or persist claims."""
+
+    try:
+        encoded = token.split(".")[1]
+        encoded += "=" * (-len(encoded) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(encoded).decode("utf-8"))
+        puid = str(claims.get("oid") or claims.get("puid") or "")
+        tenant = str(claims.get("tid") or "")
+        return f"PUID:{puid}@{tenant}" if puid and tenant else ""
+    except (
+        IndexError,
+        ValueError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        binascii.Error,
+    ):
+        return ""
+
+
+def _session_headers(
+    auth: CapturedAuth,
+    *,
+    token: str | None = None,
+    json_body: bool = False,
+) -> dict[str, str]:
+    headers = {
+        "Authorization": f"Bearer {token or auth.token}",
+        "Accept": "application/json",
+    }
+    if auth.api_root == OUTLOOK_REST_ROOT:
+        if auth.anchor_mailbox:
+            headers["X-AnchorMailbox"] = auth.anchor_mailbox
+        cookie = "; ".join(
+        f"{item.name}={item.value}"
+        for item in auth.cookies
+        if _safe_cookie(item) and _outlook_cookie_domain(item.domain)
+        )
+        if cookie:
+            headers["Cookie"] = cookie
+    headers["Prefer"] = 'outlook.body-content-type="text"'
+    if json_body:
+        headers["Content-Type"] = "application/json"
+    return headers
+
+
+def _error(message: str, *, status_code: int | None = None, url: str | None = None,
+           response_body: str | None = None, retryable: bool = False) -> GraphError:
+    exc = GraphError(
+        message,
+        status=status_code,
+        code="owa_http_error" if status_code is not None else "owa_error",
+        operation="owa_request",
+        retryable=retryable,
+        detail=response_body,
+    )
+    exc.status_code = status_code
+    exc.url = url
+    exc.response_body = response_body
+    exc.retryable = retryable
+    exc.metadata = {"status_code": status_code, "url": url, "retryable": retryable}
+    return exc
+
+
+def _root_for_url(url: str) -> str | None:
+    try:
+        parsed = urlsplit(url)
+        if parsed.scheme != "https" or parsed.username or parsed.password or parsed.port:
+            return None
+        if (parsed.hostname or "").lower() == "graph.microsoft.com":
+            return GRAPH_ROOT
+        if (parsed.hostname or "").lower() in OWA_HOSTS:
+            return OUTLOOK_REST_ROOT
+    except ValueError:
+        pass
+    return None
+
+
+def _is_loopback_cdp_url(url: str) -> bool:
+    try:
+        parsed = urlsplit(url)
+        return (
+            parsed.scheme == "http"
+            and not parsed.username
+            and not parsed.password
+            and (parsed.hostname or "").lower() in {"127.0.0.1", "::1", "localhost"}
+        )
+    except ValueError:
+        return False
 
 
 class OwaMailbox:
-    """Mailbox backed by the Outlook-in-Edge session instead of an Entra app."""
-
-    def __init__(self, cdp_url: str, read_write: bool = False):
+    def __init__(self, cdp_url: str, read_write: bool = False, max_scan_pages: int = 10):
+        if not _is_loopback_cdp_url(cdp_url):
+            raise ConfigurationError(
+                "EDGE_CDP_URL must be an HTTP loopback endpoint with an explicit port"
+            )
         self.cdp_url = cdp_url.rstrip("/")
         self.read_write = read_write
+        self.max_scan_pages = max(1, int(max_scan_pages))
         self._auth: CapturedAuth | None = None
         self._folder_ids: dict[str, str] = {}
 
     def access_token(self) -> str:
         if self._auth is None:
             self._auth = capture_edge_auth(self.cdp_url)
+        if not self._auth.token:
+            raise _error("Outlook session token was empty")
         return self._auth.token
 
-    def unread_messages(self, limit: int) -> list[GraphMessage]:
+    def unread_messages(self, limit: int, exclude_ids: set[str] | None = None) -> list[GraphMessage]:
+        if limit <= 0:
+            return []
         token = self.access_token()
         auth = self._auth
         if auth is None:
-            raise GraphError("Outlook session token was not captured")
-        outlook_rest = auth.api_root == OUTLOOK_REST_ROOT
-        query = urlencode(
-            {
-                "$filter": "IsRead eq false" if outlook_rest else "isRead eq false",
-                "$top": str(min(limit, 50)),
-                "$select": (
-                    "Id,InternetMessageId,Subject,From,ReceivedDateTime,Body,"
-                    "HasAttachments,IsRead"
-                    if outlook_rest
-                    else "id,internetMessageId,subject,from,receivedDateTime,body,"
-                    "sensitivity,hasAttachments,isRead"
-                ),
-            }
-        )
+            raise _error("Outlook session token not captured")
+        rest = auth.api_root == OUTLOOK_REST_ROOT
+        select = ("Id,InternetMessageId,Subject,From,ReceivedDateTime,HasAttachments,IsRead"
+                  if rest else "id,internetMessageId,subject,from,receivedDateTime,hasAttachments,isRead,@odata.type")
+        query = urlencode({"$filter": "IsRead eq false" if rest else "isRead eq false",
+                           "$top": str(min(max(limit, 1), 50)), "$select": select})
         url: str | None = f"{auth.api_root}/me/mailFolders/inbox/messages?{query}"
+        excluded = {str(item) for item in (exclude_ids or set())}
         messages: list[GraphMessage] = []
-        while url and len(messages) < limit:
+        pages = 0
+        while url and len(messages) < limit and pages < self.max_scan_pages:
+            if _root_for_url(url) != auth.api_root:
+                raise _error("Outlook pagination link is not an approved API URL", url=url)
             payload = self._json_request("GET", url, absolute=True, token=token)
+            token = self.access_token()
+            pages += 1
             for raw in payload.get("value", []):
-                messages.append(
-                    _parse_message(_normalize_outlook_message(raw) if outlook_rest else raw)
-                )
+                message_id = str(_value(raw, "id") or "")
+                if not message_id or message_id in excluded or _is_calendar_item(raw):
+                    continue
+                # Some Outlook deployments ignore $select and include the body in
+                # the listing response. Reuse it; otherwise fetch the eligible body.
+                detail = raw if _value(raw, "body") is not None else None
+                if detail is None:
+                    detail_query = urlencode({"$select": (
+                        "Id,InternetMessageId,Subject,From,ReceivedDateTime,Body,HasAttachments,IsRead" if rest else
+                        "id,internetMessageId,subject,from,receivedDateTime,body,sensitivity,hasAttachments,isRead")})
+                    detail = self._json_request(
+                        "GET",
+                        f"{auth.api_root}/me/messages/{quote(message_id, safe='')}?{detail_query}",
+                        absolute=True,
+                        token=token,
+                    )
+                    token = self.access_token()
+                messages.append(_parse_message(_normalize_outlook_message(detail) if rest else detail))
                 if len(messages) >= limit:
                     break
-            url = payload.get("@odata.nextLink")
+            next_url = payload.get("@odata.nextLink")
+            url = str(next_url) if next_url else None
+        if url and len(messages) < limit:
+            raise GraphError(
+                "Outlook scan exceeded max_scan_pages",
+                code="scan_limit",
+                operation="pagination",
+                retryable=True,
+            )
         return messages
 
-    def _json_request(
-        self,
-        method: str,
-        path: str,
-        payload: dict[str, Any] | None = None,
-        *,
-        absolute: bool = False,
-        token: str | None = None,
-    ) -> dict[str, Any]:
-        if self.read_write is False and method not in {"GET"}:
-            raise GraphError("write operations require --apply with Outlook on the web")
+    def probe_access(self) -> None:
+        """Validate the captured session without parsing or retaining response data."""
+
+        if not _is_loopback_cdp_url(self.cdp_url):
+            raise GraphError(
+                "Outlook live probe requires a loopback Edge debugging endpoint",
+                code="unsafe_cdp_url",
+                operation="live_probe",
+            )
+        auth = self._auth or capture_edge_auth(self.cdp_url)
+        try:
+            rest = auth.api_root == OUTLOOK_REST_ROOT
+            query = urlencode({"$top": "1", "$select": "Id" if rest else "id"})
+            url = f"{auth.api_root}/me/mailFolders/inbox/messages?{query}"
+            if _root_for_url(url) != auth.api_root:
+                raise GraphError(
+                    "Outlook live probe rejected an unapproved API origin",
+                    code="unsafe_probe_origin",
+                    operation="live_probe",
+                )
+            request = Request(
+                url,
+                headers=_session_headers(auth),
+                method="GET",
+            )
+            try:
+                with urlopen(request, timeout=30):
+                    return
+            except HTTPError as exc:
+                if exc.code == 401:
+                    refreshed = capture_edge_auth(self.cdp_url)
+                    retry = Request(
+                        url,
+                        headers=_session_headers(refreshed),
+                        method="GET",
+                    )
+                    try:
+                        with urlopen(retry, timeout=30):
+                            return
+                    except HTTPError as retry_exc:
+                        raise GraphError(
+                            "Outlook live probe was denied",
+                            status=retry_exc.code,
+                            code="probe_denied",
+                            operation="live_probe",
+                            retryable=retry_exc.code >= 500,
+                        ) from retry_exc
+                    except (URLError, TimeoutError) as retry_exc:
+                        raise GraphError(
+                            "Outlook live probe transport failed",
+                            code="probe_transport_error",
+                            operation="live_probe",
+                            retryable=True,
+                        ) from retry_exc
+                raise GraphError(
+                    "Outlook live probe was denied",
+                    status=exc.code,
+                    code="probe_denied",
+                    operation="live_probe",
+                    retryable=exc.code >= 500,
+                ) from exc
+            except (URLError, TimeoutError) as exc:
+                raise GraphError(
+                    "Outlook live probe transport failed",
+                    code="probe_transport_error",
+                    operation="live_probe",
+                    retryable=True,
+                ) from exc
+        finally:
+            self._auth = None
+
+    def _json_request(self, method: str, path: str, payload: dict[str, Any] | None = None,
+                      *, absolute: bool = False, token: str | None = None,
+                      _allow_401_retry: bool = True) -> dict[str, Any]:
+        if not self.read_write and method not in {"GET"}:
+            raise _error("write operations require --apply with Outlook on the web")
         root = self._auth.api_root if self._auth else GRAPH_ROOT
         url = path if absolute else f"{root}{path}"
+        if _root_for_url(url) != root:
+            raise _error("Outlook request URL is not an approved HTTPS API URL", url=url)
+        bearer = token or self.access_token()
+        auth = self._auth or CapturedAuth(bearer, root)
         request = Request(
             url,
             data=json.dumps(payload).encode("utf-8") if payload is not None else None,
-            headers={
-                "Authorization": f"Bearer {token or self.access_token()}",
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-                "Prefer": 'outlook.body-content-type="text"',
-            },
+            headers=_session_headers(auth, token=bearer, json_body=payload is not None),
             method=method,
         )
         try:
             with urlopen(request, timeout=30) as response:
                 body = response.read()
-                return json.loads(body) if body else {}
+            return json.loads(body) if body else {}
         except HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")[:400]
-            raise GraphError(f"Outlook session {method} failed ({exc.code}): {detail}") from exc
+            if exc.code == 401 and _allow_401_retry:
+                self._auth = capture_edge_auth(self.cdp_url)
+                return self._json_request(method, path, payload, absolute=absolute, token=self._auth.token,
+                                          _allow_401_retry=False)
+            raise _error(f"Outlook request failed ({exc.code})", status_code=exc.code, url=url,
+                         retryable=exc.code in {408, 429, 500, 502, 503, 504}) from exc
         except (URLError, TimeoutError, json.JSONDecodeError) as exc:
-            raise GraphError("Outlook session request failed") from exc
+            raise _error("Outlook session request failed", url=url, retryable=True) from exc
 
     def ensure_folder_path(self, folder_path: str) -> str:
         if folder_path in self._folder_ids:
             return self._folder_ids[folder_path]
-        parent = "inbox"
-        walked = ""
-        for segment in [part.strip() for part in folder_path.split("/") if part.strip()]:
+        parent, walked = "inbox", ""
+        rest = self._auth is not None and self._auth.api_root == OUTLOOK_REST_ROOT
+        for segment in [p.strip() for p in folder_path.split("/") if p.strip()]:
             walked = f"{walked}/{segment}" if walked else segment
-            cached = self._folder_ids.get(walked)
-            if cached:
-                parent = cached
+            if walked in self._folder_ids:
+                parent = self._folder_ids[walked]
                 continue
             escaped = segment.replace("'", "''")
-            outlook_rest = self._auth is not None and self._auth.api_root == OUTLOOK_REST_ROOT
-            query = urlencode(
-                {
-                    "$filter": (
-                        f"DisplayName eq '{escaped}'"
-                        if outlook_rest
-                        else f"displayName eq '{escaped}'"
-                    ),
-                    "$select": "Id,DisplayName" if outlook_rest else "id,displayName",
-                    "$top": "10",
-                }
-            )
-            found = self._json_request("GET", f"/me/mailFolders/{parent}/childFolders?{query}")
-            matches = [
-                item
-                for item in found.get("value", [])
-                if _value(item, "displayName") == segment and _value(item, "id")
-            ]
+            query = urlencode({"$filter": f"{'DisplayName' if rest else 'displayName'} eq '{escaped}'",
+                               "$select": "Id,DisplayName" if rest else "id,displayName", "$top": "10"})
+            found = self._json_request("GET", f"/me/mailFolders/{quote(parent, safe='')}/childFolders?{query}")
+            matches = [i for i in found.get("value", []) if _value(i, "displayName") == segment and _value(i, "id")]
+            if len(matches) > 1:
+                raise _error(f"Outlook folder path is ambiguous: {segment!r}")
             if matches:
                 folder_id = str(_value(matches[0], "id"))
             else:
-                created = self._json_request(
-                    "POST",
-                    f"/me/mailFolders/{parent}/childFolders",
-                    {"DisplayName" if outlook_rest else "displayName": segment},
-                )
+                created = self._json_request("POST", f"/me/mailFolders/{quote(parent, safe='')}/childFolders",
+                                              {"DisplayName" if rest else "displayName": segment})
                 folder_id = str(_value(created, "id") or "")
                 if not folder_id:
-                    raise GraphError(f"Outlook session did not return an id for folder {segment!r}")
+                    raise _error(f"Outlook session did not return an id for folder {segment!r}")
             self._folder_ids[walked] = folder_id
             parent = folder_id
         return parent
 
-    def update_message(
-        self,
-        message_id: str,
-        categories: tuple[str, ...] | None = None,
-        is_read: bool | None = None,
-    ) -> None:
+    def update_message(self, message_id: str, categories: tuple[str, ...] | None = None, is_read: bool | None = None) -> None:
+        rest = self._auth is not None and self._auth.api_root == OUTLOOK_REST_ROOT
         payload: dict[str, Any] = {}
-        outlook_rest = self._auth is not None and self._auth.api_root == OUTLOOK_REST_ROOT
-        if categories is not None:
-            payload["Categories" if outlook_rest else "categories"] = list(categories)
-        if is_read is not None:
-            payload["IsRead" if outlook_rest else "isRead"] = is_read
-        if payload:
-            self._json_request("PATCH", f"/me/messages/{message_id}", payload)
+        if categories is not None: payload["Categories" if rest else "categories"] = list(categories)
+        if is_read is not None: payload["IsRead" if rest else "isRead"] = is_read
+        if payload: self._json_request("PATCH", f"/me/messages/{quote(message_id, safe='')}", payload)
 
     def create_reply_draft(self, message_id: str, reply_text: str) -> str:
-        outlook_rest = self._auth is not None and self._auth.api_root == OUTLOOK_REST_ROOT
-        draft = self._json_request(
-            "POST",
-            f"/me/messages/{message_id}/createReply",
-            {"Comment" if outlook_rest else "comment": _text_to_html(reply_text)},
-        )
-        return str(_value(draft, "id") or "")
+        rest = self._auth is not None and self._auth.api_root == OUTLOOK_REST_ROOT
+        body = _text_to_html(reply_text)
+        payload = {"Body" if rest else "body": {"ContentType" if rest else "contentType": "HTML",
+                                                   "Content" if rest else "content": body}}
+        return str(_value(self._json_request("POST", f"/me/messages/{quote(message_id, safe='')}/createReply", payload), "id") or "")
 
     def move_message(self, message_id: str, folder_id: str) -> str:
-        outlook_rest = self._auth is not None and self._auth.api_root == OUTLOOK_REST_ROOT
-        moved = self._json_request(
-            "POST",
-            f"/me/messages/{message_id}/move",
-            {"DestinationId" if outlook_rest else "destinationId": folder_id},
-        )
-        return str(_value(moved, "id") or message_id)
+        rest = self._auth is not None and self._auth.api_root == OUTLOOK_REST_ROOT
+        payload = {"DestinationId" if rest else "destinationId": folder_id}
+        return str(_value(self._json_request("POST", f"/me/messages/{quote(message_id, safe='')}/move", payload), "id") or "")
 
 
 def edge_debug_available(cdp_url: str) -> bool:
+    if not _is_loopback_cdp_url(cdp_url):
+        return False
     try:
         with urlopen(f"{cdp_url.rstrip('/')}/json/version", timeout=2) as response:
             return 200 <= getattr(response, "status", 200) < 300
@@ -1859,136 +2629,100 @@ def edge_debug_available(cdp_url: str) -> bool:
         return False
 
 
-def capture_edge_auth(cdp_url: str) -> CapturedAuth:
-    """Attach to Edge, find the Outlook tab, and copy the bearer token it already uses."""
+def session_diagnostic(cdp_url: str) -> dict[str, object]:
+    available = edge_debug_available(cdp_url)
+    return {"available": available, "code": "ready" if available else "cdp_unreachable",
+            "detail": "Edge debugging endpoint only; no session token or mail was read."}
 
+
+# Descriptive aliases kept for callers that expose a backend diagnostic verb.
+owa_session_diagnostic = session_diagnostic
+diagnose_session = session_diagnostic
+
+
+def capture_edge_auth(cdp_url: str) -> CapturedAuth:
+    if not _is_loopback_cdp_url(cdp_url):
+        raise ConfigurationError(
+            "EDGE_CDP_URL must be an HTTP loopback endpoint with an explicit port"
+        )
     if not edge_debug_available(cdp_url):
         raise ConfigurationError(EDGE_DEBUG_HELP)
     try:
         from playwright.sync_api import sync_playwright
-    except ImportError as exc:
-        raise ConfigurationError(
-            "Outlook-in-Edge mode needs Playwright installed for this user (no admin): "
-            "python3 -m pip install --user playwright"
-        ) from exc
-
-    auth: CapturedAuth | None = None
-    playwright = sync_playwright().start()
-    browser = None
-    try:
+        playwright = sync_playwright().start()
+        browser = None
         try:
             browser = playwright.chromium.connect_over_cdp(cdp_url)
-        except Exception as exc:
-            raise ConfigurationError(EDGE_DEBUG_HELP) from exc
-        page = _outlook_page(browser)
-        auth = _auth_from_page(page)
+            page = _outlook_page(browser)
+            auth = _auth_from_page(page)
+            if auth is not None:
+                auth = replace(
+                    auth,
+                    anchor_mailbox=(
+                        auth.anchor_mailbox or _anchor_from_token(auth.token)
+                    ),
+                    cookies=_capture_cookies(page),
+                )
+        finally:
+            # Playwright.stop() closes browsers it owns. This browser belongs to the
+            # user and was only attached over CDP, so replace close during teardown.
+            if browser is not None:
+                browser.close = lambda *args, **kwargs: None
+            playwright.stop()
     except ConfigurationError:
         raise
     except Exception as exc:
-        raise ConfigurationError(f"Could not attach to Outlook in Edge: {exc}") from exc
-    finally:
-        # stop() would otherwise Browser.close() the user's Outlook window.
-        if browser is not None:
-            browser.close = lambda *args, **kwargs: None
-        playwright.stop()
-    if not auth:
-        raise ConfigurationError(
-            "Connected to Edge but did not see an Outlook bearer token. Open "
-            "https://outlook.office.com/mail/inbox in that Edge window and retry."
-        )
+        raise ConfigurationError("Could not inspect the signed-in Outlook tab") from exc
+    if auth is None:
+        raise ConfigurationError("No approved Outlook API bearer token was observed in the tab")
     return auth
 
 
 def _outlook_page(browser: Any) -> Any:
     for context in browser.contexts:
         for page in context.pages:
-            url = (page.url or "").lower()
-            if any(host in url for host in OWA_HOSTS):
+            if (urlsplit(page.url or "").hostname or "").lower() in OWA_HOSTS:
                 return page
-    raise ConfigurationError(
-        "Edge is open with debugging, but no Outlook on the web tab was found. "
-        "Keep https://outlook.office.com/mail/ open in Edge and retry."
-    )
+    raise ConfigurationError("No Outlook on the web tab is open in Edge")
 
 
 def _auth_from_page(page: Any) -> CapturedAuth | None:
     captured: dict[str, CapturedAuth] = {}
-
     def on_request(request: Any) -> None:
-        if captured.get("auth"):
-            return
-        url = request.url or ""
-        if "graph.microsoft.com" in url:
-            api_root = GRAPH_ROOT
-        elif any(host in url for host in OWA_HOSTS):
-            api_root = OUTLOOK_REST_ROOT
-        else:
-            return
-        headers = {key.lower(): value for key, value in request.headers.items()}
+        headers = {str(key).lower(): value for key, value in request.headers.items()}
         authorization = headers.get("authorization", "")
-        if authorization.lower().startswith("bearer ") and len(authorization) > 20:
-            captured["auth"] = CapturedAuth(
-                token=authorization.split(" ", 1)[1].strip(),
-                api_root=api_root,
-            )
-
+        if not authorization.lower().startswith("bearer "): return
+        root = _root_for_url(request.url)
+        if root:
+            token = authorization.split(None, 1)[1].strip()
+            if token:
+                captured[root] = CapturedAuth(
+                    token,
+                    root,
+                    anchor_mailbox=str(headers.get("x-anchormailbox", "")),
+                )
     page.on("request", on_request)
     _nudge_inbox(page)
-    deadline = time.time() + 3
-    while time.time() < deadline and not captured.get("auth"):
+    for _ in range(12):
+        if captured:
+            break
         page.wait_for_timeout(250)
-    if not captured.get("auth"):
+    if not captured:
         try:
             page.reload(wait_until="domcontentloaded", timeout=15000)
         except Exception:
             pass
-        deadline = time.time() + 20
-        while time.time() < deadline and not captured.get("auth"):
+        for _ in range(80):
+            if captured:
+                break
             page.wait_for_timeout(250)
-    return captured.get("auth")
-
-
-def _value(payload: dict[str, Any], camel_name: str) -> Any:
-    """Read either Graph camelCase or Outlook REST PascalCase properties."""
-
-    if camel_name in payload:
-        return payload[camel_name]
-    pascal_name = camel_name[:1].upper() + camel_name[1:]
-    return payload.get(pascal_name)
-
-
-def _normalize_outlook_message(raw: dict[str, Any]) -> dict[str, Any]:
-    sender = _value(raw, "from") or {}
-    email_address = _value(sender, "emailAddress") or {}
-    body = _value(raw, "body") or {}
-    return {
-        "id": _value(raw, "id"),
-        "internetMessageId": _value(raw, "internetMessageId"),
-        "subject": _value(raw, "subject"),
-        "from": {
-            "emailAddress": {
-                "name": _value(email_address, "name"),
-                "address": _value(email_address, "address"),
-            }
-        },
-        "receivedDateTime": _value(raw, "receivedDateTime"),
-        "body": {"content": _value(body, "content")},
-        "sensitivity": _value(raw, "sensitivity"),
-        "hasAttachments": _value(raw, "hasAttachments"),
-        "isRead": _value(raw, "isRead"),
-        "@odata.type": raw.get("@odata.type"),
-    }
+    return captured.get(OUTLOOK_REST_ROOT) or captured.get(GRAPH_ROOT)
 
 
 def _nudge_inbox(page: Any) -> None:
-    """Trigger mail traffic without a full reload when possible."""
+    """Trigger a normal Inbox request without exposing or persisting its token."""
 
-    selectors = (
-        '[aria-label="Inbox"]',
-        '[title="Inbox"]',
-        'span:text-is("Inbox")',
-    )
-    for selector in selectors:
+    for selector in ('[aria-label="Inbox"]', 'span:text-is("Inbox")'):
         try:
             locator = page.locator(selector).first
             if locator.count() > 0:
@@ -1996,10 +2730,27 @@ def _nudge_inbox(page: Any) -> None:
                 return
         except Exception:
             continue
-    try:
-        page.reload(wait_until="domcontentloaded", timeout=15000)
-    except Exception:
-        return
+
+
+def _value(payload: dict[str, Any], camel_name: str) -> Any:
+    return payload.get(camel_name, payload.get(camel_name[:1].upper() + camel_name[1:]))
+
+
+def _is_calendar_item(raw: dict[str, Any]) -> bool:
+    kind = str(raw.get("@odata.type") or raw.get("odata.type") or "").lower()
+    item_class = str(raw.get("itemClass") or raw.get("ItemClass") or "").lower()
+    return "event" in kind or item_class.startswith("ipm.appointment")
+
+
+def _normalize_outlook_message(raw: dict[str, Any]) -> dict[str, Any]:
+    sender, body = _value(raw, "from") or {}, _value(raw, "body") or {}
+    address = _value(sender, "emailAddress") or {}
+    return {"id": _value(raw, "id"), "internetMessageId": _value(raw, "internetMessageId"),
+            "subject": _value(raw, "subject") or "", "from": {"emailAddress": {
+                "name": _value(address, "name") or "", "address": _value(address, "address") or ""}},
+            "receivedDateTime": _value(raw, "receivedDateTime"),
+            "body": {"contentType": _value(body, "contentType") or "text", "content": _value(body, "content") or ""},
+            "hasAttachments": bool(_value(raw, "hasAttachments")), "isRead": bool(_value(raw, "isRead"))}
 
 
 # -------------------------------------------------------------------------
@@ -2012,7 +2763,9 @@ class LocalMailbox:
     def __init__(self, path: Path):
         self.path = path
 
-    def unread_messages(self, limit: int) -> list[GraphMessage]:
+    def unread_messages(
+        self, limit: int, exclude_ids: set[str] | None = None
+    ) -> list[GraphMessage]:
         if not self.path.exists():
             raise ConfigurationError(f"Input path does not exist: {self.path}")
         messages: list[GraphMessage] = []
@@ -2020,7 +2773,8 @@ class LocalMailbox:
             messages.extend(_load_file(source, index))
             if len(messages) >= limit:
                 break
-        return messages[:limit]
+        excluded = exclude_ids or set()
+        return [message for message in messages if message.id not in excluded][:limit]
 
 
 def _iter_source_files(path: Path) -> list[Path]:
@@ -2380,6 +3134,138 @@ def is_interactive() -> bool:
 
 
 # -------------------------------------------------------------------------
+# email_triage/live_probe.py
+# -------------------------------------------------------------------------
+
+"""Explicit live-backend probes with a fixed, non-sensitive result boundary."""
+
+
+
+
+
+@dataclass(frozen=True)
+class LiveProbeResult:
+    source: str
+    available: bool
+    code: str
+    detail: str
+    request_scope: str = "metadata_only"
+    retained_mail_data: bool = False
+    model_contacted: bool = False
+    mailbox_mutated: bool = False
+
+    def to_dict(self) -> dict[str, str | bool]:
+        return asdict(self)
+
+
+def _failed(source: str, code: str, detail: str) -> LiveProbeResult:
+    return LiveProbeResult(source, False, code, detail)
+
+
+def run_live_probe(source: str) -> LiveProbeResult:
+    """Perform one bounded read-only readiness check and return only fixed text."""
+
+    if source == "graph":
+        tenant_id = os.getenv("MS_TENANT_ID", "").strip()
+        client_id = os.getenv("MS_CLIENT_ID", "").strip()
+        if not tenant_id or not client_id:
+            return _failed(
+                source,
+                "credentials_missing",
+                "Set MS_TENANT_ID and MS_CLIENT_ID before running the live probe.",
+            )
+        output_dir = Path(os.getenv("TRIAGE_OUTPUT_DIR", "var")).expanduser()
+        mailbox = GraphMailbox(
+            tenant_id,
+            client_id,
+            output_dir / "oauth_token_cache.json",
+            read_write=False,
+            interactive=False,
+        )
+        try:
+            mailbox.probe_access()
+        except GraphError as exc:
+            if exc.code == "authentication_required":
+                return _failed(
+                    source,
+                    "authentication_required",
+                    "Run `email-triage --login` once, then retry the live probe.",
+                )
+            code = (
+                exc.code
+                if exc.code in {"probe_denied", "probe_transport_error"}
+                else "probe_failed"
+            )
+            return _failed(
+                source,
+                code,
+                "The metadata-only Microsoft Graph request did not succeed.",
+            )
+        return LiveProbeResult(
+            source,
+            True,
+            "ready",
+            "Microsoft Graph accepted the metadata-only request.",
+        )
+
+    if source == "owa":
+        cdp_url = (
+            os.getenv("EDGE_CDP_URL", "").strip()
+            or os.getenv("OWA_CDP_URL", "").strip()
+            or "http://127.0.0.1:9222"
+        )
+        if not _is_loopback_cdp_url(cdp_url):
+            return _failed(
+                source,
+                "unsafe_cdp_url",
+                "The Edge debugging endpoint must be loopback-only.",
+            )
+        if not edge_debug_available(cdp_url):
+            return _failed(
+                source,
+                "cdp_unreachable",
+                "Open Outlook with scripts/open_outlook_in_edge.sh, then retry.",
+            )
+        try:
+            OwaMailbox(cdp_url, read_write=False).probe_access()
+        except (ConfigurationError, GraphError):
+            return _failed(
+                source,
+                "session_probe_failed",
+                "The signed-in Edge session did not complete the metadata-only request.",
+            )
+        return LiveProbeResult(
+            source,
+            True,
+            "ready",
+            "The signed-in Edge session accepted the metadata-only request.",
+        )
+
+    if source == "desktop":
+        try:
+            OutlookDesktopMailbox().probe_access()
+        except ConfigurationError:
+            return _failed(
+                source,
+                "desktop_probe_failed",
+                "Open Outlook with a front window and allow Accessibility access.",
+            )
+        return LiveProbeResult(
+            source,
+            True,
+            "ready",
+            "Outlook front-window Accessibility is available; no visible text was read.",
+            request_scope="front_window_presence_only",
+        )
+
+    return _failed(
+        source,
+        "unsupported_source",
+        "Live probing supports only graph, owa, or desktop sources.",
+    )
+
+
+# -------------------------------------------------------------------------
 # email_triage/cli.py
 # -------------------------------------------------------------------------
 
@@ -2405,8 +3291,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--source",
-        choices=("graph", "local", "owa"),
+        choices=("graph", "local", "owa", "desktop", "accessibility"),
         help="Mailbox source. --owa is the same as --source owa.",
+    )
+    parser.add_argument(
+        "--diagnose",
+        action="store_true",
+        help=(
+            "Print a metadata-only backend capability/readiness report and exit. "
+            "No mailbox content is read and no model is contacted."
+        ),
+    )
+    parser.add_argument(
+        "--live-probe",
+        action="store_true",
+        help=(
+            "Opt in to one real, read-only backend request. No model is contacted, "
+            "no mailbox data is printed or retained, and apply mode is never used."
+        ),
     )
     parser.add_argument(
         "--watch",
@@ -2475,6 +3377,57 @@ def _cli_source(args: argparse.Namespace) -> str | None:
     return args.source
 
 
+def _diagnostic_report(args: argparse.Namespace) -> dict[str, object]:
+    """Check backend readiness without reading mail, tokens, or model state."""
+
+    source = _cli_source(args) or os.getenv("TRIAGE_SOURCE", "").strip().lower()
+    if not source:
+        graph_configured = bool(os.getenv("MS_TENANT_ID", "").strip()) and bool(
+            os.getenv("MS_CLIENT_ID", "").strip()
+        )
+        source = "local" if args.input else ("graph" if graph_configured else "owa")
+    if source not in {"graph", "local", "owa", "desktop", "accessibility"}:
+        raise ConfigurationError(
+            "TRIAGE_SOURCE must be graph, local, owa, desktop, or accessibility"
+        )
+    report: dict[str, object] = {"capabilities": backend_capabilities(source).to_dict()}
+    if source == "owa":
+        cdp_url = (
+            os.getenv("EDGE_CDP_URL", "").strip()
+            or os.getenv("OWA_CDP_URL", "").strip()
+            or "http://127.0.0.1:9222"
+        )
+        available = edge_debug_available(cdp_url)
+        report["readiness"] = {
+            "available": available,
+            "code": "ready" if available else "cdp_unreachable",
+            "detail": "Edge debugging endpoint only; no session token or mail was read.",
+        }
+    elif source == "desktop":
+        report["readiness"] = desktop_diagnostic().to_dict()
+    elif source == "accessibility":
+        report["readiness"] = accessibility_diagnostic().to_dict()
+    elif source == "local":
+        raw_path = args.input or os.getenv("TRIAGE_INPUT", "")
+        path = Path(raw_path).expanduser() if raw_path else None
+        available = path is not None and path.exists()
+        report["readiness"] = {
+            "available": available,
+            "code": "ready" if available else "input_missing",
+            "detail": "Checks only whether the selected local path exists.",
+        }
+    else:
+        available = bool(os.getenv("MS_TENANT_ID", "").strip()) and bool(
+            os.getenv("MS_CLIENT_ID", "").strip()
+        )
+        report["readiness"] = {
+            "available": available,
+            "code": "configured" if available else "credentials_missing",
+            "detail": "Checks configuration presence only; no authentication was attempted.",
+        }
+    return report
+
+
 def _build_graph_mailbox(settings: Settings, interactive: bool) -> GraphMailbox:
     return GraphMailbox(
         settings.tenant_id,
@@ -2482,6 +3435,7 @@ def _build_graph_mailbox(settings: Settings, interactive: bool) -> GraphMailbox:
         settings.output_dir / "oauth_token_cache.json",
         read_write=settings.apply_changes,
         interactive=interactive,
+        max_scan_pages=settings.max_retrieval_pages,
     )
 
 
@@ -2515,16 +3469,40 @@ def run(args: argparse.Namespace) -> int:
     if settings.mailbox_source == "local":
         if settings.input_path is None:
             raise ConfigurationError("Local mailbox source is missing an input path")
-        mailbox_source: GraphMailbox | LocalMailbox | OwaMailbox = LocalMailbox(
+        mailbox_source: (
+            GraphMailbox
+            | LocalMailbox
+            | OwaMailbox
+            | OutlookDesktopMailbox
+            | OutlookAccessibilityMailbox
+        ) = LocalMailbox(
             settings.input_path
         )
         print(f"Using local mailbox {settings.input_path}.", file=sys.stderr)
     elif settings.mailbox_source == "owa":
-        live_mailbox = OwaMailbox(settings.owa_cdp_url, read_write=settings.apply_changes)
+        live_mailbox = OwaMailbox(
+            settings.owa_cdp_url,
+            read_write=settings.apply_changes,
+            max_scan_pages=settings.max_retrieval_pages,
+        )
         mailbox_source = live_mailbox
         print(
             f"Using Outlook on the web in Edge at {settings.owa_cdp_url}. "
             "Mail is never sent.",
+            file=sys.stderr,
+        )
+    elif settings.mailbox_source == "desktop":
+        mailbox_source = OutlookDesktopMailbox()
+        print(
+            "Using one user-opened, frontmost Outlook message through macOS "
+            "Accessibility. This adapter is read-only and never enumerates the mailbox.",
+            file=sys.stderr,
+        )
+    elif settings.mailbox_source == "accessibility":
+        mailbox_source = OutlookAccessibilityMailbox()
+        print(
+            "Using currently visible unread rows in the already-open Outlook Inbox "
+            "through macOS Accessibility. This adapter is preview-only.",
             file=sys.stderr,
         )
     else:
@@ -2572,7 +3550,10 @@ def run(args: argparse.Namespace) -> int:
     processed = 0
     skipped = 0
     failures = 0
-    for message in mailbox_source.unread_messages(settings.max_unread_messages):
+    excluded = set() if args.include_previously_processed else queue.seen_ids
+    for message in mailbox_source.unread_messages(
+        settings.max_unread_messages, exclude_ids=excluded
+    ):
         if queue.contains(message.id) and not args.include_previously_processed:
             skipped += 1
             continue
@@ -2627,6 +3608,29 @@ def _cli_main(argv: list[str] | None = None) -> int:
                 "Ignoring --input; --owa reads the live Outlook tab in Edge.",
                 file=sys.stderr,
             )
+        if args.diagnose and args.live_probe:
+            raise ConfigurationError("--diagnose and --live-probe are mutually exclusive")
+        if args.diagnose:
+            print(json.dumps(_diagnostic_report(args), sort_keys=True))
+            return 0
+        if args.live_probe:
+            if args.apply or args.mark_read or args.login or args.watch is not None:
+                raise ConfigurationError(
+                    "--live-probe cannot be combined with --apply, --mark-read, "
+                    "--login, or --watch"
+                )
+            source = _cli_source(args)
+            if source is None:
+                raise ConfigurationError(
+                    "--live-probe requires an explicit --source graph|owa|desktop"
+                )
+            if source == "local" or args.input:
+                raise ConfigurationError(
+                    "--live-probe supports only graph, owa, or desktop without --input"
+                )
+            result = run_live_probe(source)
+            print(json.dumps(result.to_dict(), sort_keys=True))
+            return 0 if result.available else 2
         output_dir = Path(os.getenv("TRIAGE_OUTPUT_DIR", "var")).expanduser()
         watch_seconds = args.watch
         if watch_seconds is not None and watch_seconds < 1:
@@ -2749,10 +3753,10 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(settings.mailbox_source, "local")
         self.assertEqual(settings.input_path, Path("samples/inbox.jsonl"))
 
-    def test_missing_graph_explains_owa_and_local_workarounds(self) -> None:
+    def test_missing_graph_defaults_to_credential_free_owa(self) -> None:
         with patch.dict("os.environ", {"TRIAGE_BACKEND": "ollama"}, clear=True):
-            with self.assertRaisesRegex(ConfigurationError, "--owa"):
-                Settings.from_env()
+            settings = Settings.from_env()
+        self.assertEqual(settings.mailbox_source, "owa")
 
     def test_remote_ollama_requires_approval(self) -> None:
         environment = {
@@ -2764,6 +3768,237 @@ class ConfigurationTests(unittest.TestCase):
         with patch.dict("os.environ", environment, clear=True):
             with self.assertRaisesRegex(ConfigurationError, "remote inference host"):
                 Settings.from_env()
+
+    def test_desktop_source_needs_no_graph_registration_and_is_read_only(self) -> None:
+        environment = {
+            "TRIAGE_BACKEND": "ollama",
+            "OLLAMA_HOST": "http://127.0.0.1:11434",
+        }
+        with patch.dict("os.environ", environment, clear=True):
+            settings = Settings.from_env(source="desktop")
+            self.assertEqual(settings.mailbox_source, "desktop")
+            with self.assertRaisesRegex(ConfigurationError, "read-only"):
+                Settings.from_env(source="desktop", apply_changes=True)
+            with self.assertRaisesRegex(ConfigurationError, "cannot mark"):
+                Settings.from_env(source="desktop", mark_read=True)
+
+    def test_accessibility_source_needs_no_graph_and_is_read_only(self) -> None:
+        environment = {
+            "TRIAGE_BACKEND": "ollama",
+            "OLLAMA_HOST": "http://127.0.0.1:11434",
+        }
+        with patch.dict("os.environ", environment, clear=True):
+            settings = Settings.from_env(source="accessibility")
+            self.assertEqual(settings.mailbox_source, "accessibility")
+            with self.assertRaisesRegex(ConfigurationError, "read-only"):
+                Settings.from_env(source="accessibility", apply_changes=True)
+
+
+# -------------------------------------------------------------------------
+# tests/test_backends.py
+# -------------------------------------------------------------------------
+
+class BackendCapabilitiesTests(unittest.TestCase):
+    def test_every_backend_explicitly_disallows_send_and_attachment_content(self) -> None:
+        for source in ("graph", "owa", "local", "desktop", "accessibility"):
+            capabilities = backend_capabilities(source)
+            self.assertFalse(capabilities.send_mail)
+            self.assertFalse(capabilities.attachment_content)
+            self.assertFalse(capabilities.bulk_body_export)
+
+    def test_desktop_is_single_message_and_read_only(self) -> None:
+        capabilities = backend_capabilities("desktop")
+        self.assertFalse(capabilities.supports_apply)
+        self.assertEqual(capabilities.read_scope, "frontmost_outlook_message_only")
+
+    def test_accessibility_scans_only_visible_unread_rows(self) -> None:
+        capabilities = backend_capabilities("accessibility")
+        self.assertFalse(capabilities.supports_apply)
+        self.assertEqual(capabilities.read_scope, "visible_unread_inbox_rows")
+        self.assertTrue(capabilities.metadata_prefilter)
+
+
+# -------------------------------------------------------------------------
+# tests/test_desktop.py
+# -------------------------------------------------------------------------
+
+class SequencedRunner:
+    def __init__(self, results: list[subprocess.CompletedProcess[str]]):
+        self.results = list(results)
+        self.calls: list[list[str]] = []
+
+    def __call__(self, command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        self.calls.append(command)
+        return self.results.pop(0)
+
+
+class DesktopMailboxTests(unittest.TestCase):
+    @patch(__name__ + ".shutil")
+    @patch(__name__ + ".platform")
+    def test_reads_only_frontmost_visible_message(self, platform_module, shutil_module) -> None:
+        platform_module.system.return_value = "Darwin"
+        shutil_module.which.return_value = "/usr/bin/osascript"
+        runner = SequencedRunner(
+            [
+                subprocess.CompletedProcess([], 0, stdout="true\n", stderr=""),
+                subprocess.CompletedProcess(
+                    [], 0, stdout="Synthetic subject\nVisible body text\n", stderr=""
+                ),
+            ]
+        )
+        mailbox = OutlookDesktopMailbox(runner)
+        messages = mailbox.unread_messages(20)
+        self.assertEqual(messages[0].subject, "Synthetic subject")
+        self.assertEqual(messages[0].body, "")
+        self.assertNotIn("Visible body text", messages[0].id)
+        self.assertFalse(hasattr(mailbox, "move_message"))
+        self.assertFalse(hasattr(mailbox, "create_reply_draft"))
+        self.assertEqual(len(runner.calls), 2)
+
+    @patch(__name__ + ".platform")
+    def test_non_macos_fails_closed_without_running_a_command(self, platform_module) -> None:
+        platform_module.system.return_value = "Linux"
+        runner = SequencedRunner([])
+        result = desktop_diagnostic(runner)
+        self.assertFalse(result.available)
+        self.assertEqual(result.code, "unsupported_platform")
+        self.assertEqual(runner.calls, [])
+
+    @patch(__name__ + ".shutil")
+    @patch(__name__ + ".platform")
+    def test_processed_visible_message_is_excluded(self, platform_module, shutil_module) -> None:
+        platform_module.system.return_value = "Darwin"
+        shutil_module.which.return_value = "/usr/bin/osascript"
+        first = SequencedRunner(
+            [
+                subprocess.CompletedProcess([], 0, stdout="true\n", stderr=""),
+                subprocess.CompletedProcess([], 0, stdout="Subject\nBody\n", stderr=""),
+            ]
+        )
+        message = OutlookDesktopMailbox(first).unread_messages(1)[0]
+        second = SequencedRunner(
+            [
+                subprocess.CompletedProcess([], 0, stdout="true\n", stderr=""),
+                subprocess.CompletedProcess([], 0, stdout="Subject\nBody\n", stderr=""),
+            ]
+        )
+        self.assertEqual(
+            OutlookDesktopMailbox(second).unread_messages(1, {message.id}), []
+        )
+
+
+# -------------------------------------------------------------------------
+# tests/test_accessibility.py
+# -------------------------------------------------------------------------
+
+class Element:
+    def __init__(self, role="AXGroup", children=None, **attrs):
+        self.attrs = {"AXRole": role, **attrs}
+        self.attrs.setdefault("AXChildren", list(children or []))
+        self.selected = False
+
+    def getAttribute(self, name):
+        return self.attrs.get(name)
+
+    def setAttribute(self, name, value):
+        self.attrs[name] = value
+        if name == "AXSelected":
+            self.selected = value
+
+
+class App:
+    def __init__(self, window):
+        self.window = window
+
+    def windows(self):
+        return [self.window]
+
+
+class AccessibilityTests(unittest.TestCase):
+    def make_app(self):
+        unread = Element("AXRow", AXTitle="Subject", children=[Element("AXImage", AXDescription="Unread")])
+        read = Element("AXRow", AXTitle="Do not include", children=[Element("AXImage", AXDescription="Read")])
+        table = Element("AXTable", children=[unread, read], AXRows=[unread, read])
+        pane = Element("AXGroup", AXTitle="Reading Pane", AXBody="Body text", AXSenderName="Alex", AXSenderAddress="alex@example.org", AXReceivedAt="2026-08-20T10:00:00+00:00")
+        window = Element("AXWindow", AXTitle="Inbox", children=[table, pane])
+        module = types.SimpleNamespace(getAppRefByBundleId=lambda bundle: App(window))
+        return module, unread
+
+    def test_only_explicitly_unread_visible_rows_are_read_without_selection(self):
+        module, row = self.make_app()
+        mailbox = OutlookAccessibilityMailbox(module, sleep=lambda _: None)
+        messages = mailbox.unread_messages(10)
+        self.assertEqual(len(messages), 1)
+        self.assertFalse(row.selected)
+        self.assertEqual(messages[0].body, "Subject\nUnread")
+        self.assertEqual(messages[0].sender_address, "")
+
+    def test_limit_and_exclude_are_deterministic(self):
+        module, _ = self.make_app()
+        mailbox = AccessibilityMailbox(module, sleep=lambda _: None)
+        first = mailbox.unread_messages(1)[0]
+        self.assertEqual(mailbox.unread_messages(1, {first.id}), [])
+        self.assertEqual(first.id, mailbox.unread_messages(1)[0].id)
+
+    def test_outlook_split_group_header_and_webarea_layout(self):
+        row = Element(
+            "AXRow",
+            AXTitle="Row preview",
+            children=[Element("AXImage", AXDescription="Unread")],
+        )
+        table = Element("AXTable", AXVisibleRows=[row], AXRows=[row])
+        header = Element(
+            "AXGroup",
+            children=[
+                Element("AXStaticText", AXValue="Quarterly update"),
+                Element("AXStaticText", AXValue="Alex <alex@example.org>"),
+            ],
+        )
+        body = Element(
+            "AXGroup",
+            children=[
+                Element(
+                    "AXWebArea",
+                    children=[Element("AXStaticText", AXValue="Visible body")],
+                )
+            ],
+        )
+        content = Element(
+            "AXSplitGroup",
+            children=[Element("AXGroup", children=[table]), Element(), header, Element(), body],
+        )
+        inner = Element("AXSplitGroup", children=[content])
+        main = Element("AXSplitGroup", children=[inner])
+        window = Element("AXWindow", AXTitle="Inbox", children=[main])
+        module = types.SimpleNamespace(
+            getAppRefByBundleId=lambda _bundle: App(window)
+        )
+
+        message = OutlookAccessibilityMailbox(module, sleep=lambda _: None).unread_messages(1)[0]
+        self.assertEqual(message.subject, "Row preview")
+        self.assertEqual(message.sender_address, "")
+        self.assertEqual(message.body, "Row preview\nUnread")
+        self.assertFalse(row.selected)
+
+    def test_missing_optional_dependency_is_actionable(self):
+        with patch(__name__ + ".importlib") as importlib_module:
+            importlib_module.import_module.side_effect = ImportError
+            with self.assertRaisesRegex(ConfigurationError, "atomacos"):
+                OutlookAccessibilityMailbox().unread_messages(1)
+
+    def test_missing_inbox_fails_closed(self):
+        module = types.SimpleNamespace(getAppRefByBundleId=lambda _: App(Element("AXWindow", AXTitle="Calendar")))
+        with self.assertRaisesRegex(ConfigurationError, "Inbox"):
+            OutlookAccessibilityMailbox(module).unread_messages(1)
+
+    @patch(__name__ + ".platform")
+    def test_diagnostic_checks_tree_without_selecting_rows(self, platform_module):
+        platform_module.system.return_value = "Darwin"
+        module, row = self.make_app()
+        result = accessibility_diagnostic(module)
+        self.assertTrue(result.available)
+        self.assertEqual(result.code, "ready")
+        self.assertFalse(row.selected)
 
 
 # -------------------------------------------------------------------------
@@ -2916,6 +4151,20 @@ class LocalMailboxTests(unittest.TestCase):
 # tests/test_graph.py
 # -------------------------------------------------------------------------
 
+class JsonResponse:
+    def __init__(self, payload: dict):
+        self.payload = json.dumps(payload).encode("utf-8")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return None
+
+    def read(self) -> bytes:
+        return self.payload
+
+
 class GraphParsingTests(unittest.TestCase):
     def test_graph_message_body_and_attachment_boolean_are_parsed(self):
         message = _parse_message(
@@ -2935,11 +4184,144 @@ class GraphParsingTests(unittest.TestCase):
         self.assertEqual(message.sensitivity, "private")
 
 
+class GraphHardeningTests(unittest.TestCase):
+    def mailbox(self, max_scan_pages: int = 10) -> GraphMailbox:
+        return GraphMailbox(
+            "tenant",
+            "client",
+            Path(tempfile.gettempdir()) / "unused-email-triage-token.json",
+            max_scan_pages=max_scan_pages,
+        )
+
+    def test_metadata_stage_skips_processed_and_calendar_before_body_fetch(self) -> None:
+        mailbox = self.mailbox()
+        metadata = {
+            "value": [
+                {"id": "processed"},
+                {"id": "calendar", "@odata.type": "#microsoft.graph.eventMessage"},
+                {"id": "id/with+characters"},
+            ]
+        }
+        detail = {
+            "id": "id/with+characters",
+            "subject": "Eligible",
+            "from": {"emailAddress": {"address": "alex@example.org"}},
+            "body": {"content": "Body"},
+        }
+        with patch.object(mailbox, "access_token", return_value="token"), patch.object(
+            mailbox, "_request_json", side_effect=[(metadata, "token"), (detail, "token")]
+        ) as request:
+            messages = mailbox.unread_messages(5, {"processed"})
+        self.assertEqual([message.id for message in messages], ["id/with+characters"])
+        self.assertEqual(request.call_count, 2)
+        body_url = request.call_args_list[1].args[0].full_url
+        self.assertIn("id%2Fwith%2Bcharacters", body_url)
+
+    def test_untrusted_pagination_origin_is_rejected(self) -> None:
+        mailbox = self.mailbox()
+        with patch.object(mailbox, "access_token", return_value="token"), patch.object(
+            mailbox,
+            "_request_json",
+            return_value=({"value": [], "@odata.nextLink": "https://evil.example/messages"}, "token"),
+        ):
+            with self.assertRaises(GraphError) as caught:
+                mailbox.unread_messages(1)
+        self.assertEqual(caught.exception.code, "unsafe_next_link")
+
+    def test_page_scan_limit_fails_boundedly(self) -> None:
+        mailbox = self.mailbox(max_scan_pages=1)
+        next_link = f"{GRAPH_ROOT}/me/messages?$skiptoken=next"
+        with patch.object(mailbox, "access_token", return_value="token"), patch.object(
+            mailbox,
+            "_request_json",
+            return_value=({"value": [], "@odata.nextLink": next_link}, "token"),
+        ):
+            with self.assertRaises(GraphError) as caught:
+                mailbox.unread_messages(1)
+        self.assertEqual(caught.exception.code, "scan_limit")
+
+    def test_401_refreshes_once_and_returns_structured_error_context(self) -> None:
+        mailbox = self.mailbox()
+        expired = HTTPError(
+            f"{GRAPH_ROOT}/me", 401, "expired", None, io.BytesIO(b"expired")
+        )
+        request = Request(
+            f"{GRAPH_ROOT}/me", headers={"Authorization": "Bearer old-token"}
+        )
+        with patch(__name__ + ".urlopen", side_effect=[expired, JsonResponse({"id": "me"})]) as open_url, patch.object(
+            mailbox, "_refresh_access_token", return_value="fresh-token"
+        ):
+            payload, token = mailbox._request_json(
+                request, token="old-token", operation="profile"
+            )
+        self.assertEqual(payload, {"id": "me"})
+        self.assertEqual(token, "fresh-token")
+        self.assertEqual(open_url.call_count, 2)
+        error = GraphError("bounded", code="example", operation="test")
+        self.assertEqual(error.to_dict()["code"], "example")
+
+    def test_401_retry_transport_failure_stays_structured(self) -> None:
+        mailbox = self.mailbox()
+        expired = HTTPError(
+            f"{GRAPH_ROOT}/me", 401, "expired", None, io.BytesIO(b"expired")
+        )
+        request = Request(
+            f"{GRAPH_ROOT}/me", headers={"Authorization": "Bearer old-token"}
+        )
+        with patch(
+            __name__ + ".urlopen",
+            side_effect=[expired, URLError("offline")],
+        ), patch.object(
+            mailbox, "_refresh_access_token", return_value="fresh-token"
+        ):
+            with self.assertRaises(GraphError) as caught:
+                mailbox._request_json(
+                    request, token="old-token", operation="profile"
+                )
+        self.assertEqual(caught.exception.code, "retry_transport_error")
+        self.assertTrue(caught.exception.retryable)
+
+    def test_duplicate_exact_folder_names_fail_closed(self) -> None:
+        mailbox = GraphMailbox(
+            "tenant", "client", Path("unused"), read_write=True
+        )
+        duplicate = {
+            "value": [
+                {"id": "one", "displayName": "AI Triage"},
+                {"id": "two", "displayName": "AI Triage"},
+            ]
+        }
+        with patch.object(mailbox, "_json_request", return_value=duplicate):
+            with self.assertRaises(GraphError) as caught:
+                mailbox.ensure_folder_path("AI Triage")
+        self.assertEqual(caught.exception.code, "ambiguous_folder")
+
+
 # -------------------------------------------------------------------------
 # tests/test_owa.py
 # -------------------------------------------------------------------------
 
 class OwaConfigTests(unittest.TestCase):
+    def test_edge_helper_uses_dedicated_profile_without_quitting_browser(self) -> None:
+        root = Path(__file__).resolve().parent
+        if root.name == "tests":
+            root = root.parent
+        script_path = root / "scripts" / "open_outlook_in_edge.sh"
+        if not script_path.exists():
+            return
+        script = script_path.read_text(encoding="utf-8")
+        self.assertIn("--user-data-dir", script)
+        self.assertIn("--remote-debugging-address=127.0.0.1", script)
+        self.assertIn('"$EDGE_BIN_PATH" \\', script)
+        self.assertIn("for _ in {1..60}; do", script)
+        self.assertIn("OWA_URL must be HTTPS on an approved Outlook host", script)
+        self.assertIn("EDGE_PROFILE_DIR must not be a symbolic link", script)
+        self.assertIn("Library/Application Support/MailTriage/EdgeProfile", script)
+        self.assertIn(".mail-triage-cdp-owner", script)
+        self.assertIn("Refusing an unrecognized process", script)
+        self.assertNotIn("TRIAGE_OUTPUT_DIR", script)
+        self.assertNotIn('tell application "Microsoft Edge" quit', script)
+
     def test_owa_source_does_not_need_entra_app(self) -> None:
         environment = {
             "TRIAGE_BACKEND": "ollama",
@@ -2979,10 +4361,99 @@ class OwaConfigTests(unittest.TestCase):
         }
         with patch.dict("os.environ", environment, clear=True):
             settings = Settings.from_env(source="owa")
-        self.assertEqual(settings.mailbox_source, "owa")
+            self.assertEqual(settings.mailbox_source, "owa")
+
+    def test_owa_source_rejects_remote_browser_debugging_endpoint(self) -> None:
+        environment = {
+            "TRIAGE_BACKEND": "ollama",
+            "TRIAGE_SOURCE": "owa",
+            "OLLAMA_HOST": "http://127.0.0.1:11434",
+            "EDGE_CDP_URL": "http://remote.example:9222",
+        }
+        with patch.dict("os.environ", environment, clear=True):
+            with self.assertRaisesRegex(ConfigurationError, "loopback endpoint"):
+                Settings.from_env()
 
 
 class OwaMailboxTests(unittest.TestCase):
+    def test_normal_owa_path_rejects_remote_browser_debugging_endpoint(self) -> None:
+        with self.assertRaisesRegex(ConfigurationError, "loopback endpoint"):
+            OwaMailbox("http://remote.example:9222")
+        with patch(__name__ + ".urlopen") as opener:
+            self.assertFalse(edge_debug_available("http://remote.example:9222"))
+            opener.assert_not_called()
+        with self.assertRaisesRegex(ConfigurationError, "loopback endpoint"):
+            capture_edge_auth("http://remote.example:9222")
+
+    def test_browser_cookie_capture_keeps_only_outlook_rest_domains(self) -> None:
+        class Context:
+            @staticmethod
+            def cookies():
+                return [
+                    {"name": "allowed", "value": "one", "domain": ".outlook.office.com"},
+                    {"name": "login", "value": "two", "domain": "login.microsoftonline.com"},
+                ]
+
+        class Page:
+            context = Context()
+
+        self.assertEqual(
+            _capture_cookies(Page()),
+            (CapturedCookie("allowed", "one", ".outlook.office.com"),),
+        )
+
+    def test_outlook_rest_replay_includes_only_allowlisted_session_headers(self) -> None:
+        auth = CapturedAuth(
+            "synthetic-token",
+            OUTLOOK_REST_ROOT,
+            anchor_mailbox="PUID:object@tenant",
+            cookies=(
+                CapturedCookie("good", "allowed-value", ".outlook.office.com"),
+                CapturedCookie("evil", "blocked-value", "evil.example"),
+            ),
+        )
+        headers = _session_headers(auth)
+        self.assertEqual(headers["X-AnchorMailbox"], "PUID:object@tenant")
+        self.assertEqual(headers["Cookie"], "good=allowed-value")
+        self.assertNotIn("blocked-value", json.dumps(headers))
+        self.assertNotIn("synthetic-token", repr(auth))
+        self.assertNotIn("allowed-value", repr(auth))
+
+    def test_outlook_rest_replay_drops_header_injection_cookie_material(self) -> None:
+        auth = CapturedAuth(
+            "synthetic-token",
+            OUTLOOK_REST_ROOT,
+            cookies=(
+                CapturedCookie("safe", "allowed", ".outlook.office.com"),
+                CapturedCookie("bad\r\nInjected", "blocked", ".outlook.office.com"),
+                CapturedCookie(
+                    "also-bad", "blocked\r\nInjected: yes", ".outlook.office.com"
+                ),
+            ),
+        )
+
+        headers = _session_headers(auth)
+
+        self.assertEqual(headers["Cookie"], "safe=allowed")
+
+    def test_anchor_mailbox_is_derived_from_browser_token_in_memory(self) -> None:
+        payload = base64.urlsafe_b64encode(
+            json.dumps({"oid": "object", "tid": "tenant"}).encode("utf-8")
+        ).decode("ascii").rstrip("=")
+        self.assertEqual(
+            _anchor_from_token(f"header.{payload}.signature"),
+            "PUID:object@tenant",
+        )
+
+    def test_only_exact_approved_https_origins_are_accepted(self) -> None:
+        self.assertEqual(
+            _root_for_url("https://outlook.office365.com/owa/service.svc"),
+            OUTLOOK_REST_ROOT,
+        )
+        self.assertIsNone(_root_for_url("http://outlook.office.com/owa"))
+        self.assertIsNone(_root_for_url("https://outlook.office.com.evil.example/owa"))
+        self.assertIsNone(_root_for_url("https://user@outlook.office.com/owa"))
+
     def test_token_capture_routes_outlook_token_to_matching_api(self) -> None:
         class FakeRequest:
             def __init__(self, url: str, token: str):
@@ -3090,6 +4561,7 @@ class OwaMailboxTests(unittest.TestCase):
         self.assertEqual(messages[0].body, "Synthetic body")
         self.assertIn("IsRead+eq+false", request.call_args.args[1])
         self.assertNotIn("Sensitivity", request.call_args.args[1])
+        self.assertNotIn("%40odata.type", request.call_args.args[1])
 
     def test_outlook_rest_writes_use_pascal_case(self) -> None:
         mailbox = OwaMailbox("http://127.0.0.1:9222", read_write=True)
@@ -3101,11 +4573,116 @@ class OwaMailboxTests(unittest.TestCase):
             {"Categories": ["Needs Reply"], "IsRead": True},
         )
 
-    def test_writes_require_apply(self) -> None:
+    def test_unread_messages_401_refreshes_token_once(self) -> None:
+        mailbox = OwaMailbox("http://127.0.0.1:9222", read_write=False)
+        mailbox._auth = CapturedAuth("old-token")
+
+        first_err = HTTPError(
+            url="https://graph.microsoft.com/v1.0/me/messages?$top=1",
+            code=401,
+            msg="unauthorized",
+            hdrs=None,
+            fp=io.BytesIO(b"expired"),
+        )
+
+        payload = {
+            "value": [
+                {
+                    "id": "example-id",
+                    "internetMessageId": "example-internet-id",
+                    "subject": "Synthetic subject",
+                    "from": {"emailAddress": {"name": "Alex", "address": "alex@example.org"}},
+                    "receivedDateTime": "2026-08-13T12:00:00Z",
+                    "body": {"contentType": "text", "content": "Synthetic body"},
+                    "sensitivity": "normal",
+                    "hasAttachments": False,
+                }
+            ]
+        }
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return None
+
+            def read(self) -> bytes:
+                return json.dumps(payload).encode("utf-8")
+
+        with patch(__name__ + ".capture_edge_auth") as refresh, patch(
+            __name__ + ".urlopen", side_effect=[first_err, FakeResponse()]
+        ) as request:
+            refresh.return_value = CapturedAuth("new-token")
+            messages = mailbox.unread_messages(5)
+
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(refresh.call_count, 1)
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(messages[0].id, "example-id")
+
+
+    def test_metadata_stage_skips_processed_and_calendar_before_body_fetch(self) -> None:
         mailbox = OwaMailbox("http://127.0.0.1:9222", read_write=False)
         mailbox._auth = CapturedAuth("synthetic-token")
-        with self.assertRaisesRegex(GraphError, "--apply"):
-            mailbox.update_message("example-id", is_read=True)
+        metadata = {
+            "value": [
+                {"id": "processed"},
+                {"id": "calendar", "@odata.type": "#microsoft.graph.eventMessage"},
+                {"id": "eligible"},
+            ]
+        }
+        detail = {
+            "id": "eligible",
+            "subject": "Eligible",
+            "from": {"emailAddress": {"address": "alex@example.org"}},
+            "body": {"content": "Body"},
+        }
+        with patch.object(
+            mailbox, "_json_request", side_effect=[metadata, detail]
+        ) as request:
+            messages = mailbox.unread_messages(5, {"processed"})
+        self.assertEqual([message.id for message in messages], ["eligible"])
+        self.assertEqual(request.call_count, 2)
+
+    def test_untrusted_pagination_origin_is_rejected(self) -> None:
+        mailbox = OwaMailbox("http://127.0.0.1:9222", read_write=False)
+        mailbox._auth = CapturedAuth("synthetic-token")
+        payload = {
+            "value": [],
+            "@odata.nextLink": "https://evil.example/messages",
+        }
+        with patch.object(mailbox, "_json_request", return_value=payload):
+            with self.assertRaisesRegex(GraphError, "approved API URL"):
+                mailbox.unread_messages(1)
+
+    def test_page_scan_limit_is_reported(self) -> None:
+        mailbox = OwaMailbox(
+            "http://127.0.0.1:9222", read_write=False, max_scan_pages=1
+        )
+        mailbox._auth = CapturedAuth("synthetic-token")
+        payload = {
+            "value": [],
+            "@odata.nextLink": "https://graph.microsoft.com/v1.0/me/messages?$skiptoken=next",
+        }
+        with patch.object(mailbox, "_json_request", return_value=payload):
+            with self.assertRaises(GraphError) as caught:
+                mailbox.unread_messages(1)
+        self.assertEqual(caught.exception.code, "scan_limit")
+
+    def test_duplicate_exact_folder_names_fail_closed(self) -> None:
+        mailbox = OwaMailbox("http://127.0.0.1:9222", read_write=True)
+        mailbox._auth = CapturedAuth("synthetic-token")
+        duplicate = {
+            "value": [
+                {"id": "one", "displayName": "AI Triage"},
+                {"id": "two", "displayName": "AI Triage"},
+            ]
+        }
+        with patch.object(mailbox, "_json_request", return_value=duplicate):
+            with self.assertRaises(GraphError) as caught:
+                mailbox.ensure_folder_path("AI Triage")
+        self.assertIn("ambiguous", str(caught.exception).lower())
 
 
 # -------------------------------------------------------------------------
@@ -3163,13 +4740,32 @@ class PipelineTests(unittest.TestCase):
         self.assertTrue(record.analysis.suggested_reply.endswith("Best,\nNick"))
 
     def test_no_reply_sender_is_forced_to_no_reply(self):
+        classifier = FakeClassifier()
         record = process_message(
             self.message(sender_address="no-reply@example.org"),
-            FakeClassifier(),
+            classifier,
             12_000,
         )
         self.assertEqual(record.analysis.route, Route.NO_REPLY)
         self.assertIsNone(record.analysis.suggested_reply)
+        self.assertEqual(classifier.calls, 0)
+
+    def test_no_reply_sender_does_not_bypass_local_clinical_review(self):
+        classifier = FakeClassifier()
+        record = process_message(
+            self.message(
+                sender_address="no-reply@example.org",
+                body="The patient has a new diagnosis and medication change.",
+            ),
+            classifier,
+            12_000,
+        )
+        self.assertEqual(record.analysis.route, Route.NEEDS_REVIEW)
+        self.assertEqual(
+            record.analysis.manual_review_reason,
+            ManualReviewReason.CLINICAL_OR_PATIENT,
+        )
+        self.assertEqual(classifier.calls, 0)
 
     def test_clinical_body_never_reaches_classifier(self):
         classifier = FakeClassifier()
@@ -3700,6 +5296,299 @@ class NonInteractiveAuthTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(GraphError, "--login"):
                 writer.access_token()
+
+
+# -------------------------------------------------------------------------
+# tests/test_cli.py
+# -------------------------------------------------------------------------
+
+class DiagnosticCliTests(unittest.TestCase):
+    def test_graph_diagnostic_does_not_authenticate(self) -> None:
+        args = build_parser().parse_args(["--source", "graph", "--diagnose"])
+        with patch.dict("os.environ", {}, clear=True):
+            report = _diagnostic_report(args)
+        self.assertEqual(report["readiness"]["code"], "credentials_missing")
+        self.assertFalse(report["capabilities"]["send_mail"])
+
+    def test_owa_diagnostic_checks_only_debug_endpoint(self) -> None:
+        args = build_parser().parse_args(["--owa", "--diagnose"])
+        with patch(__name__ + ".edge_debug_available", return_value=True):
+            report = _diagnostic_report(args)
+        self.assertEqual(report["readiness"]["code"], "ready")
+        self.assertIn("no session token", report["readiness"]["detail"])
+
+    def test_diagnostic_defaults_to_owa_without_graph_registration(self) -> None:
+        args = build_parser().parse_args(["--diagnose"])
+        with patch.dict("os.environ", {}, clear=True), patch(
+            __name__ + ".edge_debug_available", return_value=False
+        ):
+            report = _diagnostic_report(args)
+        self.assertEqual(report["capabilities"]["source"], "owa")
+        self.assertEqual(report["readiness"]["code"], "cdp_unreachable")
+
+
+# -------------------------------------------------------------------------
+# tests/test_live_probe.py
+# -------------------------------------------------------------------------
+
+def _successful_urlopen() -> MagicMock:
+    opened = MagicMock()
+    opened.return_value.__enter__.return_value = MagicMock()
+    return opened
+
+
+class BackendProbeTests(unittest.TestCase):
+    def test_graph_probe_discards_response_without_parsing(self) -> None:
+        mailbox = GraphMailbox("tenant", "client", Path("unused"), interactive=False)
+        opened = _successful_urlopen()
+        with patch.object(
+            mailbox, "access_token", return_value="secret-token"
+        ) as token, patch(__name__ + ".urlopen", opened):
+            self.assertIsNone(mailbox.probe_access())
+
+        token.assert_called_once_with(persist=False)
+        request = opened.call_args.args[0]
+        self.assertEqual(
+            parse_qs(urlparse(request.full_url).query),
+            {"$top": ["1"], "$select": ["id"]},
+        )
+        self.assertNotIn("body", request.full_url.lower())
+        opened.return_value.__enter__.return_value.read.assert_not_called()
+
+    def test_graph_probe_refreshes_in_memory_without_writing_cache(self) -> None:
+        mailbox = GraphMailbox("tenant", "client", Path("unused"), interactive=False)
+        cached = {
+            "access_token": "expired-token",
+            "refresh_token": "refresh-token",
+            "expires_at": 0,
+            "scopes": mailbox.scopes,
+        }
+        opened = _successful_urlopen()
+        with patch.object(mailbox, "_load_cache", return_value=cached), patch.object(
+            mailbox,
+            "_post_form",
+            return_value={"access_token": "fresh-token", "expires_in": 3600},
+        ), patch.object(mailbox, "_save_cache") as save, patch(
+            __name__ + ".urlopen", opened
+        ):
+            mailbox.probe_access()
+        save.assert_not_called()
+
+    def test_graph_probe_without_cached_auth_is_non_interactive(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            mailbox = GraphMailbox(
+                "tenant",
+                "client",
+                Path(directory) / "missing.json",
+                interactive=False,
+            )
+            output = io.StringIO()
+            with patch(__name__ + ".urlopen") as opened, redirect_stdout(output):
+                with self.assertRaises(GraphError) as caught:
+                    mailbox.probe_access()
+        self.assertEqual(caught.exception.code, "authentication_required")
+        self.assertEqual(output.getvalue(), "")
+        opened.assert_not_called()
+
+    def test_owa_probe_discards_response_and_clears_captured_auth(self) -> None:
+        mailbox = OwaMailbox("http://127.0.0.1:9222", read_write=False)
+        mailbox._auth = CapturedAuth("secret-token")
+        opened = _successful_urlopen()
+        with patch(__name__ + ".urlopen", opened):
+            self.assertIsNone(mailbox.probe_access())
+
+        request = opened.call_args.args[0]
+        self.assertEqual(
+            parse_qs(urlparse(request.full_url).query),
+            {"$top": ["1"], "$select": ["id"]},
+        )
+        self.assertNotIn("body", request.full_url.lower())
+        opened.return_value.__enter__.return_value.read.assert_not_called()
+        self.assertIsNone(mailbox._auth)
+
+    def test_owa_probe_retries_401_once_and_clears_auth(self) -> None:
+        mailbox = OwaMailbox("http://127.0.0.1:9222", read_write=False)
+        mailbox._auth = CapturedAuth("expired-token")
+        denied = HTTPError("https://graph.microsoft.com", 401, "denied", None, None)
+        success = MagicMock()
+        with patch(
+            __name__ + ".urlopen", side_effect=[denied, success]
+        ) as opened, patch(
+            __name__ + ".capture_edge_auth",
+            return_value=CapturedAuth("fresh-token"),
+        ) as capture:
+            mailbox.probe_access()
+        self.assertEqual(opened.call_count, 2)
+        capture.assert_called_once_with("http://127.0.0.1:9222")
+        self.assertIsNone(mailbox._auth)
+
+    def test_owa_probe_rejects_remote_debug_endpoint_before_contact(self) -> None:
+        with patch(__name__ + ".capture_edge_auth") as capture, patch(
+            __name__ + ".urlopen"
+        ) as opened:
+            with self.assertRaisesRegex(ConfigurationError, "loopback endpoint"):
+                OwaMailbox("http://192.0.2.10:9222", read_write=False)
+            capture.assert_not_called()
+            opened.assert_not_called()
+
+    def test_owa_auth_capture_detaches_without_closing_edge(self) -> None:
+        browser = MagicMock()
+        original_close = browser.close
+        playwright = MagicMock()
+        playwright.chromium.connect_over_cdp.return_value = browser
+        playwright.stop.side_effect = lambda: browser.close()
+        controller = MagicMock()
+        controller.start.return_value = playwright
+
+        playwright_package = ModuleType("playwright")
+        playwright_package.__path__ = []
+        sync_api = ModuleType("playwright.sync_api")
+        sync_api.sync_playwright = MagicMock(return_value=controller)
+        auth = CapturedAuth("synthetic-token")
+        with patch.dict(
+            sys.modules,
+            {"playwright": playwright_package, "playwright.sync_api": sync_api},
+        ), patch(
+            __name__ + ".edge_debug_available", return_value=True
+        ), patch(
+            __name__ + "._outlook_page", return_value=object()
+        ), patch(
+            __name__ + "._auth_from_page", return_value=auth
+        ):
+            self.assertEqual(
+                capture_edge_auth("http://127.0.0.1:9222"),
+                auth,
+            )
+
+        playwright.stop.assert_called_once_with()
+        original_close.assert_not_called()
+
+    @patch(__name__ + ".shutil")
+    @patch(__name__ + ".platform")
+    def test_desktop_probe_checks_window_without_visible_text(
+        self, platform_module: MagicMock, shutil_module: MagicMock
+    ) -> None:
+        platform_module.system.return_value = "Darwin"
+        shutil_module.which.return_value = "/usr/bin/osascript"
+        results = iter(
+            [
+                subprocess.CompletedProcess([], 0, stdout="true\n", stderr=""),
+                subprocess.CompletedProcess([], 0, stdout="ready\n", stderr=""),
+            ]
+        )
+        calls: list[list[str]] = []
+
+        def runner(command: list[str], **_kwargs: object):
+            calls.append(command)
+            return next(results)
+
+        mailbox = OutlookDesktopMailbox(runner)
+        self.assertIsNone(mailbox.probe_access())
+        self.assertEqual(len(calls), 2)
+        probe_script = calls[1][-1].lower()
+        self.assertNotIn("static text", probe_script)
+        self.assertNotIn("visibletext", probe_script)
+
+
+class LiveProbeBoundaryTests(unittest.TestCase):
+    def assert_privacy_contract(self, result: LiveProbeResult) -> None:
+        self.assertFalse(result.retained_mail_data)
+        self.assertFalse(result.model_contacted)
+        self.assertFalse(result.mailbox_mutated)
+
+    def test_graph_missing_registration_fails_before_backend_creation(self) -> None:
+        with patch.dict(os.environ, {}, clear=True), patch(
+            __name__ + ".GraphMailbox"
+        ) as mailbox:
+            result = run_live_probe("graph")
+        self.assertEqual(result.code, "credentials_missing")
+        mailbox.assert_not_called()
+        self.assert_privacy_contract(result)
+
+    def test_graph_errors_are_redacted(self) -> None:
+        secret = "secret-token secret-subject secret-message-id"
+        error = GraphError(secret, code="remote_secret_code", detail=secret)
+        with patch.dict(
+            os.environ,
+            {"MS_TENANT_ID": "tenant", "MS_CLIENT_ID": "client"},
+            clear=True,
+        ), patch(__name__ + ".GraphMailbox") as mailbox:
+            mailbox.return_value.probe_access.side_effect = error
+            result = run_live_probe("graph")
+        rendered = json.dumps(result.to_dict())
+        self.assertEqual(result.code, "probe_failed")
+        self.assertNotIn("secret", rendered)
+        self.assert_privacy_contract(result)
+
+    def test_owa_rejects_remote_cdp_before_network_check(self) -> None:
+        with patch.dict(
+            os.environ, {"EDGE_CDP_URL": "http://192.0.2.10:9222"}, clear=True
+        ), patch(__name__ + ".edge_debug_available") as available:
+            result = run_live_probe("owa")
+        self.assertEqual(result.code, "unsafe_cdp_url")
+        available.assert_not_called()
+        self.assert_privacy_contract(result)
+
+    def test_owa_unavailable_is_actionable(self) -> None:
+        with patch.dict(os.environ, {}, clear=True), patch(
+            __name__ + ".edge_debug_available", return_value=False
+        ), patch(__name__ + ".OwaMailbox") as mailbox:
+            result = run_live_probe("owa")
+        self.assertEqual(result.code, "cdp_unreachable")
+        self.assertIn("open_outlook_in_edge.sh", result.detail)
+        mailbox.assert_not_called()
+        self.assert_privacy_contract(result)
+
+    def test_success_results_preserve_the_privacy_contract(self) -> None:
+        with patch(__name__ + ".edge_debug_available", return_value=True), patch(
+            __name__ + ".OwaMailbox"
+        ) as owa:
+            owa_result = run_live_probe("owa")
+        with patch(__name__ + ".OutlookDesktopMailbox") as desktop:
+            desktop_result = run_live_probe("desktop")
+        owa.return_value.probe_access.assert_called_once_with()
+        desktop.return_value.probe_access.assert_called_once_with()
+        for result in (owa_result, desktop_result):
+            self.assertTrue(result.available)
+            self.assertEqual(result.code, "ready")
+            self.assert_privacy_contract(result)
+
+    def test_local_source_is_not_a_live_probe(self) -> None:
+        result = run_live_probe("local")
+        self.assertFalse(result.available)
+        self.assertEqual(result.code, "unsupported_source")
+        self.assert_privacy_contract(result)
+
+    def test_cli_prints_only_probe_json_and_skips_model_setup(self) -> None:
+        result = LiveProbeResult("graph", True, "ready", "Fixed safe detail.")
+        output = io.StringIO()
+        with patch(__name__ + ".run_live_probe", return_value=result), patch(
+            __name__ + ".build_classifier"
+        ) as classifier, patch(
+            __name__ + "._list_ollama_models"
+        ) as models, redirect_stdout(output):
+            status = main(["--source", "graph", "--live-probe"])
+        self.assertEqual(status, 0)
+        self.assertEqual(json.loads(output.getvalue()), result.to_dict())
+        classifier.assert_not_called()
+        models.assert_not_called()
+
+    def test_cli_rejects_implicit_local_and_operational_flags(self) -> None:
+        cases = [
+            ["--live-probe"],
+            ["--source", "local", "--live-probe"],
+            ["--source", "graph", "--live-probe", "--apply"],
+            ["--source", "graph", "--live-probe", "--mark-read"],
+            ["--source", "graph", "--live-probe", "--login"],
+            ["--source", "graph", "--live-probe", "--watch"],
+        ]
+        for argv in cases:
+            with self.subTest(argv=argv), patch(
+                __name__ + ".run_live_probe"
+            ) as probe, redirect_stderr(io.StringIO()):
+                status = main(argv)
+            self.assertEqual(status, 2)
+            probe.assert_not_called()
 
 
 def _run_self_tests() -> int:

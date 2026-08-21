@@ -44,6 +44,21 @@ def is_loopback_url(url: str) -> bool:
         return False
 
 
+def _is_loopback_http_url(url: str) -> bool:
+    """Validate a local browser-debugging endpoint without resolving DNS."""
+    try:
+        parsed = urlparse(url)
+        return (
+            parsed.scheme == "http"
+            and parsed.username is None
+            and parsed.password is None
+            and parsed.hostname in {"127.0.0.1", "::1", "localhost"}
+            and parsed.port is not None
+        )
+    except ValueError:
+        return False
+
+
 @dataclass(frozen=True)
 class Settings:
     tenant_id: str
@@ -59,6 +74,7 @@ class Settings:
     input_path: Path | None
     owa_cdp_url: str
     max_unread_messages: int
+    max_retrieval_pages: int
     max_body_characters: int
     output_dir: Path
     apply_changes: bool = False
@@ -82,14 +98,19 @@ class Settings:
         tenant_id = os.getenv("MS_TENANT_ID", "").strip()
         client_id = os.getenv("MS_CLIENT_ID", "").strip()
         requested_source = (source or os.getenv("TRIAGE_SOURCE", "")).strip().lower()
-        if requested_source and requested_source not in {"graph", "local", "owa"}:
-            raise ConfigurationError("TRIAGE_SOURCE must be graph, local, or owa")
+        allowed_sources = {"graph", "local", "owa", "desktop", "accessibility"}
+        if requested_source and requested_source not in allowed_sources:
+            raise ConfigurationError(
+                "TRIAGE_SOURCE must be graph, local, owa, desktop, or accessibility"
+            )
         if requested_source:
             mailbox_source = requested_source
         elif resolved_input:
             mailbox_source = "local"
         else:
-            mailbox_source = "graph"
+            # Browser-session Outlook is the credential-free default. Graph is
+            # selected automatically only when both app-registration values exist.
+            mailbox_source = "graph" if tenant_id and client_id else "owa"
         if mailbox_source == "local" and not resolved_input:
             raise ConfigurationError(
                 "Local source needs --input or TRIAGE_INPUT pointing at JSONL/JSON/.eml files."
@@ -149,11 +170,24 @@ class Settings:
                 "with --input. Use --owa --apply for Outlook in Edge, or drop --apply "
                 "to preview a local file."
             )
+        if apply_enabled and mailbox_source in {"desktop", "accessibility"}:
+            raise ConfigurationError(
+                "The macOS Outlook desktop adapter is read-only and cannot be combined "
+                "with --apply. Use Graph or --owa for policy-approved mailbox writes."
+            )
+        if mark_read_enabled and mailbox_source in {"desktop", "accessibility"}:
+            raise ConfigurationError(
+                "The macOS Outlook desktop adapter cannot mark messages read."
+            )
         owa_cdp_url = (
             os.getenv("EDGE_CDP_URL", "").strip()
             or os.getenv("OWA_CDP_URL", "").strip()
             or "http://127.0.0.1:9222"
         )
+        if mailbox_source == "owa" and not _is_loopback_http_url(owa_cdp_url):
+            raise ConfigurationError(
+                "EDGE_CDP_URL must be an HTTP loopback endpoint with an explicit port"
+            )
 
         return cls(
             tenant_id=tenant_id,
@@ -169,6 +203,7 @@ class Settings:
             input_path=Path(resolved_input).expanduser() if resolved_input else None,
             owa_cdp_url=owa_cdp_url.rstrip("/"),
             max_unread_messages=_positive_int("MAX_UNREAD_MESSAGES", 20),
+            max_retrieval_pages=_positive_int("MAX_RETRIEVAL_PAGES", 10),
             max_body_characters=_positive_int("MAX_BODY_CHARACTERS", 12_000),
             output_dir=Path(os.getenv("TRIAGE_OUTPUT_DIR", "var")).expanduser(),
             apply_changes=apply_enabled,
