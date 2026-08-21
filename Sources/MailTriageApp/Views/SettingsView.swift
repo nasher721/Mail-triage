@@ -36,6 +36,16 @@ struct SettingsView: View {
         .onChange(of: store.requestTimeout) { _, _ in store.persistSettings() }
         .onChange(of: store.temperature) { _, _ in store.persistSettings() }
         .onChange(of: store.overrideTemperature) { _, _ in store.persistSettings() }
+        .onChange(of: store.screeningBaseURL) { _, _ in
+            store.persistSettings()
+            store.checkProvider(store.screeningProvider)
+        }
+        .onChange(of: store.screeningModel) { _, _ in store.persistSettings() }
+        .onChange(of: store.agentBaseURL) { _, _ in
+            store.persistSettings()
+            store.checkProvider(store.agentProvider)
+        }
+        .onChange(of: store.agentModel) { _, _ in store.persistSettings() }
     }
 
     private var generalTab: some View {
