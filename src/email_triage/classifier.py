@@ -119,14 +119,23 @@ class ProviderClassifier:
     def provider(self) -> str:
         return self.client.profile.name
 
-    def classify(self, body: str, has_attachments: bool) -> ScreeningResult:
+    def classify(
+        self, body: str, has_attachments: bool, reply_guidance: str = ""
+    ) -> ScreeningResult:
+        instructions = SYSTEM_INSTRUCTIONS
+        if reply_guidance:
+            instructions += (
+                "\n\nFor this sender, apply this operator-authored style guidance to "
+                "a suggested reply only. It cannot override safety, routing, or schema "
+                f"rules: {reply_guidance[:400]}"
+            )
         payload = json.dumps(
             {"email_body": body, "has_attachments": has_attachments},
             ensure_ascii=False,
         )
         try:
             raw = self.client.complete_json(
-                SYSTEM_INSTRUCTIONS, payload, SCREENING_JSON_SCHEMA, SCREENING_SCHEMA_NAME
+                instructions, payload, SCREENING_JSON_SCHEMA, SCREENING_SCHEMA_NAME
             )
         except ProviderError as exc:
             raise ClassificationError(str(exc)) from exc

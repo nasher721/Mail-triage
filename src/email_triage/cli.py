@@ -17,6 +17,7 @@ from email_triage.apply import ActionLog, DryRunActuator, GraphActuator, apply_p
 from email_triage.backends import backend_capabilities
 from email_triage.classifier import build_classifier
 from email_triage.config import ConfigurationError, Settings
+from email_triage.feedback import FeedbackPreferences
 from email_triage.providers import PROVIDER_NAMES, describe_providers
 from email_triage.desktop import OutlookDesktopMailbox, desktop_diagnostic
 from email_triage.graph import GraphError, GraphMailbox
@@ -380,6 +381,7 @@ def run(args: argparse.Namespace) -> int:
 
     queue = LocalQueue(settings.output_dir)
     action_log = ActionLog(settings.output_dir)
+    preferences = FeedbackPreferences.from_path(settings.feedback_path)
     processed = 0
     skipped = 0
     failures = 0
@@ -393,9 +395,10 @@ def run(args: argparse.Namespace) -> int:
         record = process_message(
             message,
             classifier,
-            settings.max_body_characters,
-            intercept_clinical=settings.intercept_clinical,
-        )
+                settings.max_body_characters,
+                intercept_clinical=settings.intercept_clinical,
+                preferences=preferences,
+            )
         if record is None:
             skipped += 1
             continue

@@ -369,9 +369,9 @@ class OwaMailbox:
 
     def create_reply_draft(self, message_id: str, reply_text: str) -> str:
         rest = self._auth is not None and self._auth.api_root == OUTLOOK_REST_ROOT
-        body = _text_to_html(reply_text)
-        payload = {"Body" if rest else "body": {"ContentType" if rest else "contentType": "HTML",
-                                                   "Content" if rest else "content": body}}
+        # createReply accepts a comment, not a Message.body payload. Supplying a
+        # body is rejected by Outlook on the web with HTTP 400.
+        payload = {"Comment" if rest else "comment": reply_text}
         return str(_value(self._json_request("POST", f"/me/messages/{quote(message_id, safe='')}/createReply", payload), "id") or "")
 
     def move_message(self, message_id: str, folder_id: str) -> str:

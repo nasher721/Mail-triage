@@ -189,6 +189,7 @@ class ReviewRecord:
     target_folder: str
     categories: tuple[str, ...]
     analysis: ScreeningResult
+    unsubscribe_suggestion: bool = False
     processing_error: str | None = None
 
     def to_dict(self) -> dict[str, Any]:

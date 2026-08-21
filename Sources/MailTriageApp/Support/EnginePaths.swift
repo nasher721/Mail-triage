@@ -90,4 +90,10 @@ enum EnginePaths {
     static var edgeProfileDirectory: URL {
         applicationSupportDirectory.appendingPathComponent("EdgeProfile", isDirectory: true)
     }
+
+    static var learningPreferencesFile: URL {
+        applicationSupportDirectory
+            .appendingPathComponent("Learning", isDirectory: true)
+            .appendingPathComponent("preferences.json")
+    }
 }

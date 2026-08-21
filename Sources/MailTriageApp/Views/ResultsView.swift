@@ -185,6 +185,16 @@ private struct ResultDetailView: View {
                     }
                 }
 
+                if record.unsubscribeSuggestion == true {
+                    detailSection("Unsubscribe suggestion", symbol: "envelope.badge") {
+                        Text("This looks like a newsletter with an opt-out option. Open the original message in Outlook and use its unsubscribe control after checking the sender.")
+                            .foregroundStyle(.secondary)
+                        Text("Mail Triage never opens links or changes subscriptions automatically.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
                 if !record.analysis.actionItems.isEmpty {
                     detailSection("Action Items", symbol: "checklist") {
                         ForEach(record.analysis.actionItems, id: \.self) { item in
@@ -201,15 +211,25 @@ private struct ResultDetailView: View {
                     }
                 }
 
+                LearningControls(record: record)
+
                 if !record.actions.isEmpty {
                     detailSection("Plan", symbol: "list.bullet.clipboard") {
                         ForEach(record.actions) { action in
-                            HStack {
-                                Image(systemName: action.status == "failed" ? "xmark.circle.fill" : "checkmark.circle")
-                                    .foregroundStyle(action.status == "failed" ? .red : .green)
-                                Text(action.description)
-                                Spacer()
-                                Text(action.status.capitalized).foregroundStyle(.secondary)
+                            VStack(alignment: .leading, spacing: 4) {
+                                HStack {
+                                    Image(systemName: action.status == "failed" ? "xmark.circle.fill" : "checkmark.circle")
+                                        .foregroundStyle(action.status == "failed" ? .red : .green)
+                                    Text(action.description)
+                                    Spacer()
+                                    Text(action.status.capitalized).foregroundStyle(.secondary)
+                                }
+                                if action.status == "failed", let detail = action.detail, !detail.isEmpty {
+                                    Text(detail)
+                                        .font(.caption)
+                                        .foregroundStyle(.red)
+                                        .textSelection(.enabled)
+                                }
                             }
                         }
                     }
@@ -237,6 +257,75 @@ private struct ResultDetailView: View {
         } label: {
             Label(title, systemImage: symbol).font(.headline)
         }
+    }
+}
+
+private final class LearningControlsState: ObservableObject {
+    @Published var routePreference = ""
+    @Published var replyGuidance = ""
+    @Published var loaded = false
+}
+
+/// Saves bounded, sender-domain preferences locally for future triage runs.
+private struct LearningControls: View {
+    @EnvironmentObject private var store: AppStore
+    let record: TriageRecord
+
+    @StateObject private var state = LearningControlsState()
+
+    var body: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("These local preferences affect future messages from this sender domain. They never override clinical, prompt-injection, or low-confidence safeguards.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Picker("Future triage", selection: $state.routePreference) {
+                    Text("Keep automatic routing").tag("")
+                    Text("Prefer no reply").tag("no_reply")
+                    Text("Always review").tag("needs_review")
+                }
+
+                TextEditor(text: $state.replyGuidance)
+                    .font(.body)
+                    .frame(minHeight: 80)
+                    .overlay(alignment: .topLeading) {
+                        if state.replyGuidance.isEmpty {
+                            Text("Optional future reply guidance (for example, tone or preferred sign-off)")
+                                .foregroundStyle(.tertiary)
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 8)
+                                .allowsHitTesting(false)
+                        }
+                    }
+
+                HStack {
+                    Spacer()
+                    Button("Save for Future Messages") {
+                        store.saveLearningPreference(
+                            for: record,
+                            route: state.routePreference.isEmpty ? nil : state.routePreference,
+                            replyGuidance: state.replyGuidance
+                        )
+                    }
+                }
+            }
+        } label: {
+            Label("Teach Mail Triage", systemImage: "brain").font(.headline)
+        }
+        .onAppear(perform: load)
+        .onChange(of: record.id) { _, _ in
+            state.loaded = false
+            load()
+        }
+    }
+
+    private func load() {
+        guard !state.loaded else { return }
+        let preference = store.learningPreference(for: record)
+        state.routePreference = preference?.route ?? ""
+        state.replyGuidance = preference?.replyGuidance ?? ""
+        state.loaded = true
     }
 }
 

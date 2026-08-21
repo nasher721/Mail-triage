@@ -1,9 +1,13 @@
 import SwiftUI
 
 /// Pick which AI system screens mail, which one files it, and store the keys.
+private final class ProvidersViewState: ObservableObject {
+    @Published var expanded: AIProvider?
+}
+
 struct ProvidersView: View {
     @EnvironmentObject private var store: AppStore
-    @State private var expanded: AIProvider?
+    @StateObject private var viewState = ProvidersViewState()
 
     var body: some View {
         ScrollView {
@@ -108,9 +112,9 @@ struct ProvidersView: View {
                 ForEach(providers) { provider in
                     ProviderCard(
                         provider: provider,
-                        isExpanded: expanded == provider,
+                        isExpanded: viewState.expanded == provider,
                         toggleExpanded: {
-                            expanded = expanded == provider ? nil : provider
+                            viewState.expanded = viewState.expanded == provider ? nil : provider
                         }
                     )
                 }
@@ -155,14 +159,18 @@ struct ProvidersView: View {
     }
 }
 
+private final class ProviderCardState: ObservableObject {
+    @Published var keyDraft = ""
+    @Published var showKey = false
+}
+
 private struct ProviderCard: View {
     @EnvironmentObject private var store: AppStore
     let provider: AIProvider
     let isExpanded: Bool
     let toggleExpanded: () -> Void
 
-    @State private var keyDraft = ""
-    @State private var showKey = false
+    @StateObject private var viewState = ProviderCardState()
 
     var body: some View {
         GroupBox {
@@ -211,7 +219,7 @@ private struct ProviderCard: View {
             .padding(6)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .onAppear { keyDraft = store.apiKey(for: provider) }
+        .onAppear { viewState.keyDraft = store.apiKey(for: provider) }
     }
 
     @ViewBuilder
@@ -221,18 +229,18 @@ private struct ProviderCard: View {
             if provider.requiresAPIKey || provider == .custom {
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {
-                        if showKey {
-                            TextField("API key", text: $keyDraft)
+                        if viewState.showKey {
+                            TextField("API key", text: $viewState.keyDraft)
                         } else {
-                            SecureField("API key", text: $keyDraft)
+                            SecureField("API key", text: $viewState.keyDraft)
                         }
-                        Button(showKey ? "Hide" : "Show") { showKey.toggle() }
+                        Button(viewState.showKey ? "Hide" : "Show") { viewState.showKey.toggle() }
                             .buttonStyle(.link)
                     }
                     HStack {
-                        Button("Save Key") { store.setAPIKey(keyDraft, for: provider) }
+                        Button("Save Key") { store.setAPIKey(viewState.keyDraft, for: provider) }
                         Button("Remove") {
-                            keyDraft = ""
+                            viewState.keyDraft = ""
                             store.setAPIKey("", for: provider)
                         }
                         .disabled(!store.hasKey(for: provider))
@@ -269,7 +277,7 @@ private struct ProviderCard: View {
             .textFieldStyle(.roundedBorder)
         if !suggestions.isEmpty {
             Menu("Choose an available model") {
-                ForEach(suggestions.prefix(25), id: \.self) { name in
+                ForEach(suggestions, id: \.self) { name in
                     Button(name) { modelBinding.wrappedValue = name }
                 }
             }

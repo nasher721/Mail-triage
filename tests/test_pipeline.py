@@ -13,6 +13,7 @@ from email_triage.models import (
     Topic,
     Urgency,
 )
+from email_triage.feedback import FeedbackPreference, FeedbackPreferences
 from email_triage.pipeline import LocalQueue, process_message
 
 
@@ -39,7 +40,7 @@ class FakeClassifier:
         self.fail = fail
         self.calls = 0
 
-    def classify(self, body: str, has_attachments: bool) -> ScreeningResult:
+    def classify(self, body: str, has_attachments: bool, reply_guidance: str = "") -> ScreeningResult:
         self.calls += 1
         if self.fail:
             raise ClassificationError("synthetic failure")
@@ -132,6 +133,41 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(record.analysis.route, Route.NEEDS_REVIEW)
         self.assertEqual(record.processing_error, "ai_processing_error")
         self.assertIn("AI - Processing Error", record.categories)
+
+    def test_local_preference_can_prefer_no_reply_without_overriding_safety(self):
+        preferences = FeedbackPreferences(
+            (FeedbackPreference("example.org", Route.NO_REPLY, "Keep replies brief."),)
+        )
+        record = process_message(self.message(), FakeClassifier(), 12_000, preferences=preferences)
+        self.assertEqual(record.analysis.route, Route.NO_REPLY)
+        self.assertFalse(record.analysis.response_required)
+        self.assertIsNone(record.analysis.suggested_reply)
+
+    def test_newsletter_is_only_suggested_for_manual_unsubscribe(self):
+        result = needs_reply_result()
+        result = result.__class__(
+            summary=result.summary,
+            priority_score=1,
+            action_items=(),
+            route=Route.NO_REPLY,
+            response_required=False,
+            confidence=result.confidence,
+            urgency=Urgency.ROUTINE,
+            deadline=None,
+            topic=Topic.OTHER,
+            manual_review_reason=None,
+            rationale="Newsletter.",
+            suggested_reply=None,
+        )
+        record = process_message(
+            self.message(
+                sender_address="newsletter@example.org",
+                body="Manage preferences or unsubscribe from this weekly newsletter.",
+            ),
+            FakeClassifier(result),
+            12_000,
+        )
+        self.assertTrue(record.unsubscribe_suggestion)
 
     def test_local_queue_does_not_store_message_body_and_is_idempotent(self):
         record = process_message(self.message(), FakeClassifier(), 12_000)

@@ -129,7 +129,7 @@ enum AIProvider: String, CaseIterable, Identifiable, Codable {
     var suggestedModels: [String] {
         switch self {
         case .ollama: ["qwen3:14b", "qwen3:8b", "qwen2.5:14b", "llama3.1:8b", "qwen3:4b"]
-        case .openai: ["gpt-4o", "gpt-4o-mini", "gpt-4.1", "o4-mini"]
+        case .openai: ["gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-4.1", "gpt-4o", "gpt-4o-mini", "o4-mini"]
         case .anthropic: ["claude-sonnet-4-5", "claude-opus-4-1", "claude-haiku-4-5"]
         case .openrouter: [
             "anthropic/claude-sonnet-4.5",
@@ -194,7 +194,9 @@ enum AIProvider: String, CaseIterable, Identifiable, Codable {
     }
 
     /// Providers that publish an installed-model list the app can read cheaply.
-    var listsModels: Bool { isLocal }
+    /// OpenAI's `/models` catalogue is the authoritative, account-specific list
+    /// of available GPT models. The app fetches it without running inference.
+    var listsModels: Bool { isLocal || self == .openai }
 
     /// The relative path used to list models, when the provider offers one.
     var modelListPath: String { self == .ollama ? "/api/tags" : "/models" }

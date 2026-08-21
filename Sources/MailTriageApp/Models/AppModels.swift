@@ -121,6 +121,7 @@ struct TriageRecord: Codable, Identifiable, Equatable {
     let analysis: Analysis
     let planSource: String?
     let actions: [AppliedAction]
+    let unsubscribeSuggestion: Bool?
 
     var id: String { messageID }
 
@@ -134,6 +135,7 @@ struct TriageRecord: Codable, Identifiable, Equatable {
         case analysis
         case planSource = "plan_source"
         case actions
+        case unsubscribeSuggestion = "unsubscribe_suggestion"
     }
 
     struct Analysis: Codable, Equatable {

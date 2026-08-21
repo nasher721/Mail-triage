@@ -406,6 +406,14 @@ class OwaMailboxTests(unittest.TestCase):
                 mailbox.ensure_folder_path("AI Triage")
         self.assertIn("ambiguous", str(caught.exception).lower())
 
+    def test_create_reply_uses_comment_payload(self) -> None:
+        mailbox = OwaMailbox("http://127.0.0.1:9222", read_write=True)
+        mailbox._auth = CapturedAuth("synthetic-token")
+        with patch.object(mailbox, "_json_request", return_value={"id": "draft-1"}) as request:
+            self.assertEqual(mailbox.create_reply_draft("message-1", "Thanks."), "draft-1")
+        self.assertEqual(request.call_args.args[0], "POST")
+        self.assertEqual(request.call_args.args[2], {"comment": "Thanks."})
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -95,6 +95,7 @@ final class AppStore: ObservableObject {
     @Published private(set) var installedModels: [AIProvider: [String]] = [:]
     @Published private(set) var results: [TriageRecord] = []
     @Published private(set) var activity: [ActivityEntry] = []
+    @Published private(set) var learningRevision = 0
     @Published private(set) var isRunning = false
     @Published private(set) var lastRunDate: Date?
     @Published var errorMessage: String?
@@ -103,6 +104,7 @@ final class AppStore: ObservableObject {
     private let engine = EngineService()
     private let defaults: UserDefaults
     private let credentials: CredentialStore
+    private let learningPreferences = LearningPreferenceStore()
     private var currentOperationID: UUID?
     private var currentOperationTask: Task<Void, Never>?
     private var providerCheckTasks: [AIProvider: Task<Void, Never>] = [:]
@@ -292,6 +294,32 @@ final class AppStore: ObservableObject {
     func models(for provider: AIProvider) -> [String] {
         let discovered = installedModels[provider] ?? []
         return discovered.isEmpty ? provider.suggestedModels : discovered
+    }
+
+    func learningPreference(for record: TriageRecord) -> LearningPreference? {
+        _ = learningRevision
+        return learningPreferences.preference(for: record.senderAddress)
+    }
+
+    func saveLearningPreference(
+        for record: TriageRecord,
+        route: String?,
+        replyGuidance: String
+    ) {
+        do {
+            try learningPreferences.save(
+                senderAddress: record.senderAddress,
+                route: route,
+                replyGuidance: replyGuidance
+            )
+            learningRevision += 1
+            activity.insert(
+                ActivityEntry("Saved local learning preference for this sender domain.", kind: .success),
+                at: 0
+            )
+        } catch {
+            handle(error)
+        }
     }
 
     /// Check one provider. Local endpoints are probed; hosted ones are only

@@ -171,6 +171,7 @@ class Settings:
     max_retrieval_pages: int
     max_body_characters: int
     output_dir: Path
+    feedback_path: Path | None = None
     agent_max_rounds: int = 4
     apply_changes: bool = False
     mark_read: bool = False
@@ -347,9 +348,14 @@ class Settings:
             owa_cdp_url=owa_cdp_url.rstrip("/"),
             max_unread_messages=_positive_int("MAX_UNREAD_MESSAGES", 20),
             max_retrieval_pages=_positive_int("MAX_RETRIEVAL_PAGES", 10),
-            max_body_characters=_positive_int("MAX_BODY_CHARACTERS", 12_000),
-            output_dir=Path(os.getenv("TRIAGE_OUTPUT_DIR", "var")).expanduser(),
-            agent_max_rounds=_positive_int("TRIAGE_AGENT_MAX_ROUNDS", 4),
+        max_body_characters=_positive_int("MAX_BODY_CHARACTERS", 12_000),
+        output_dir=Path(os.getenv("TRIAGE_OUTPUT_DIR", "var")).expanduser(),
+        feedback_path=(
+            Path(os.environ["TRIAGE_FEEDBACK_FILE"]).expanduser()
+            if os.getenv("TRIAGE_FEEDBACK_FILE", "").strip()
+            else None
+        ),
+        agent_max_rounds=_positive_int("TRIAGE_AGENT_MAX_ROUNDS", 4),
             apply_changes=apply_enabled,
             mark_read=mark_read_enabled,
             use_agent=agent_enabled,

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Protocol
 
 from email_triage.classifier import ClassificationError
+from email_triage.feedback import FeedbackPreferences
 from email_triage.models import (
     Confidence,
     GraphMessage,
@@ -40,7 +41,22 @@ TOPIC_CATEGORIES = {
 
 
 class Classifier(Protocol):
-    def classify(self, body: str, has_attachments: bool) -> ScreeningResult: ...
+    def classify(
+        self, body: str, has_attachments: bool, reply_guidance: str = ""
+    ) -> ScreeningResult: ...
+
+
+def suggest_unsubscribe(message: GraphMessage, body: str, result: ScreeningResult) -> bool:
+    """Offer a manual newsletter hint without following links or changing subscriptions."""
+
+    if result.manual_review_reason is not None or result.route != Route.NO_REPLY:
+        return False
+    text = f"{message.subject}\n{body}".lower()
+    has_opt_out = any(token in text for token in ("unsubscribe", "manage preferences", "email preferences"))
+    has_newsletter_signal = message.is_no_reply_sender or any(
+        token in text for token in ("newsletter", "weekly digest", "promotions", "subscribe")
+    )
+    return has_opt_out and has_newsletter_signal
 
 
 def _manual_review(reason: ManualReviewReason, processing_error: bool = False) -> ScreeningResult:
@@ -125,11 +141,13 @@ def process_message(
     classifier: Classifier,
     max_body_characters: int,
     intercept_clinical: bool = True,
+    preferences: FeedbackPreferences | None = None,
 ) -> ReviewRecord | None:
     if message.is_calendar_message:
         return None
 
     body = body_to_text(message.body, max_body_characters)
+    preference = preferences.for_sender(message.sender_address) if preferences else None
     local_reason = local_manual_review_reason(body)
     if (
         local_reason == ManualReviewReason.CLINICAL_OR_PATIENT
@@ -143,8 +161,12 @@ def process_message(
         result = _no_reply_sender_result()
     else:
         try:
-            result = classifier.classify(body, message.has_attachments)
+            if preference and preference.reply_guidance:
+                result = classifier.classify(body, message.has_attachments, preference.reply_guidance)
+            else:
+                result = classifier.classify(body, message.has_attachments)
             result = enforce_route(result, message.is_no_reply_sender)
+            result = FeedbackPreferences.apply(result, preference)
         except (ClassificationError, ValueError):
             processing_error = "ai_processing_error"
             result = _manual_review(ManualReviewReason.LOW_CONFIDENCE, processing_error=True)
@@ -170,6 +192,7 @@ def process_message(
         target_folder=FOLDER_NAMES[result.route],
         categories=tuple(categories),
         analysis=result,
+        unsubscribe_suggestion=suggest_unsubscribe(message, body, result),
         processing_error=processing_error,
     )
 

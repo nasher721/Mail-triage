@@ -43,6 +43,7 @@ private func hosted(
     #expect(Array(command.arguments.suffix(3)) == ["--source", "owa", "--non-interactive"])
     #expect(command.environment["TRIAGE_PROVIDER"] == "ollama")
     #expect(command.environment["EDGE_CDP_URL"] == "http://127.0.0.1:9222")
+    #expect(command.environment["TRIAGE_FEEDBACK_FILE"] == EnginePaths.learningPreferencesFile.path)
     #expect(!command.arguments.contains("--apply"))
 }
 
@@ -157,6 +158,7 @@ private func hosted(
 
     #expect(AppStore.modelNames(from: ollama, provider: .ollama) == ["qwen3:8b", "llama3.1:8b"])
     #expect(AppStore.modelNames(from: openAI, provider: .lmstudio) == ["gpt-4o", "gpt-4o-mini"])
+    #expect(AIProvider.openai.listsModels)
     #expect(AppStore.modelNames(from: Data("not json".utf8), provider: .ollama).isEmpty)
 }
 

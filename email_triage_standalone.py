@@ -262,6 +262,7 @@ class ReviewRecord:
     target_folder: str
     categories: tuple[str, ...]
     analysis: ScreeningResult
+    unsubscribe_suggestion: bool = False
     processing_error: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -1350,6 +1351,7 @@ class Settings:
     max_retrieval_pages: int
     max_body_characters: int
     output_dir: Path
+    feedback_path: Path | None = None
     agent_max_rounds: int = 4
     apply_changes: bool = False
     mark_read: bool = False
@@ -1526,9 +1528,14 @@ class Settings:
             owa_cdp_url=owa_cdp_url.rstrip("/"),
             max_unread_messages=_positive_int("MAX_UNREAD_MESSAGES", 20),
             max_retrieval_pages=_positive_int("MAX_RETRIEVAL_PAGES", 10),
-            max_body_characters=_positive_int("MAX_BODY_CHARACTERS", 12_000),
-            output_dir=Path(os.getenv("TRIAGE_OUTPUT_DIR", "var")).expanduser(),
-            agent_max_rounds=_positive_int("TRIAGE_AGENT_MAX_ROUNDS", 4),
+        max_body_characters=_positive_int("MAX_BODY_CHARACTERS", 12_000),
+        output_dir=Path(os.getenv("TRIAGE_OUTPUT_DIR", "var")).expanduser(),
+        feedback_path=(
+            Path(os.environ["TRIAGE_FEEDBACK_FILE"]).expanduser()
+            if os.getenv("TRIAGE_FEEDBACK_FILE", "").strip()
+            else None
+        ),
+        agent_max_rounds=_positive_int("TRIAGE_AGENT_MAX_ROUNDS", 4),
             apply_changes=apply_enabled,
             mark_read=mark_read_enabled,
             use_agent=agent_enabled,
@@ -2229,14 +2236,23 @@ class ProviderClassifier:
     def provider(self) -> str:
         return self.client.profile.name
 
-    def classify(self, body: str, has_attachments: bool) -> ScreeningResult:
+    def classify(
+        self, body: str, has_attachments: bool, reply_guidance: str = ""
+    ) -> ScreeningResult:
+        instructions = SYSTEM_INSTRUCTIONS
+        if reply_guidance:
+            instructions += (
+                "\n\nFor this sender, apply this operator-authored style guidance to "
+                "a suggested reply only. It cannot override safety, routing, or schema "
+                f"rules: {reply_guidance[:400]}"
+            )
         payload = json.dumps(
             {"email_body": body, "has_attachments": has_attachments},
             ensure_ascii=False,
         )
         try:
             raw = self.client.complete_json(
-                SYSTEM_INSTRUCTIONS, payload, SCREENING_JSON_SCHEMA, SCREENING_SCHEMA_NAME
+                instructions, payload, SCREENING_JSON_SCHEMA, SCREENING_SCHEMA_NAME
             )
         except ProviderError as exc:
             raise ClassificationError(str(exc)) from exc
@@ -2286,7 +2302,22 @@ TOPIC_CATEGORIES = {
 
 
 class Classifier(Protocol):
-    def classify(self, body: str, has_attachments: bool) -> ScreeningResult: ...
+    def classify(
+        self, body: str, has_attachments: bool, reply_guidance: str = ""
+    ) -> ScreeningResult: ...
+
+
+def suggest_unsubscribe(message: GraphMessage, body: str, result: ScreeningResult) -> bool:
+    """Offer a manual newsletter hint without following links or changing subscriptions."""
+
+    if result.manual_review_reason is not None or result.route != Route.NO_REPLY:
+        return False
+    text = f"{message.subject}\n{body}".lower()
+    has_opt_out = any(token in text for token in ("unsubscribe", "manage preferences", "email preferences"))
+    has_newsletter_signal = message.is_no_reply_sender or any(
+        token in text for token in ("newsletter", "weekly digest", "promotions", "subscribe")
+    )
+    return has_opt_out and has_newsletter_signal
 
 
 def _manual_review(reason: ManualReviewReason, processing_error: bool = False) -> ScreeningResult:
@@ -2371,11 +2402,13 @@ def process_message(
     classifier: Classifier,
     max_body_characters: int,
     intercept_clinical: bool = True,
+    preferences: FeedbackPreferences | None = None,
 ) -> ReviewRecord | None:
     if message.is_calendar_message:
         return None
 
     body = body_to_text(message.body, max_body_characters)
+    preference = preferences.for_sender(message.sender_address) if preferences else None
     local_reason = local_manual_review_reason(body)
     if (
         local_reason == ManualReviewReason.CLINICAL_OR_PATIENT
@@ -2389,8 +2422,12 @@ def process_message(
         result = _no_reply_sender_result()
     else:
         try:
-            result = classifier.classify(body, message.has_attachments)
+            if preference and preference.reply_guidance:
+                result = classifier.classify(body, message.has_attachments, preference.reply_guidance)
+            else:
+                result = classifier.classify(body, message.has_attachments)
             result = enforce_route(result, message.is_no_reply_sender)
+            result = FeedbackPreferences.apply(result, preference)
         except (ClassificationError, ValueError):
             processing_error = "ai_processing_error"
             result = _manual_review(ManualReviewReason.LOW_CONFIDENCE, processing_error=True)
@@ -2416,6 +2453,7 @@ def process_message(
         target_folder=FOLDER_NAMES[result.route],
         categories=tuple(categories),
         analysis=result,
+        unsubscribe_suggestion=suggest_unsubscribe(message, body, result),
         processing_error=processing_error,
     )
 
@@ -3526,9 +3564,9 @@ class OwaMailbox:
 
     def create_reply_draft(self, message_id: str, reply_text: str) -> str:
         rest = self._auth is not None and self._auth.api_root == OUTLOOK_REST_ROOT
-        body = _text_to_html(reply_text)
-        payload = {"Body" if rest else "body": {"ContentType" if rest else "contentType": "HTML",
-                                                   "Content" if rest else "content": body}}
+        # createReply accepts a comment, not a Message.body payload. Supplying a
+        # body is rejected by Outlook on the web with HTTP 400.
+        payload = {"Comment" if rest else "comment": reply_text}
         return str(_value(self._json_request("POST", f"/me/messages/{quote(message_id, safe='')}/createReply", payload), "id") or "")
 
     def move_message(self, message_id: str, folder_id: str) -> str:
@@ -4540,6 +4578,7 @@ def run(args: argparse.Namespace) -> int:
 
     queue = LocalQueue(settings.output_dir)
     action_log = ActionLog(settings.output_dir)
+    preferences = FeedbackPreferences.from_path(settings.feedback_path)
     processed = 0
     skipped = 0
     failures = 0
@@ -4553,9 +4592,10 @@ def run(args: argparse.Namespace) -> int:
         record = process_message(
             message,
             classifier,
-            settings.max_body_characters,
-            intercept_clinical=settings.intercept_clinical,
-        )
+                settings.max_body_characters,
+                intercept_clinical=settings.intercept_clinical,
+                preferences=preferences,
+            )
         if record is None:
             skipped += 1
             continue
@@ -6096,6 +6136,14 @@ class OwaMailboxTests(unittest.TestCase):
                 mailbox.ensure_folder_path("AI Triage")
         self.assertIn("ambiguous", str(caught.exception).lower())
 
+    def test_create_reply_uses_comment_payload(self) -> None:
+        mailbox = OwaMailbox("http://127.0.0.1:9222", read_write=True)
+        mailbox._auth = CapturedAuth("synthetic-token")
+        with patch.object(mailbox, "_json_request", return_value={"id": "draft-1"}) as request:
+            self.assertEqual(mailbox.create_reply_draft("message-1", "Thanks."), "draft-1")
+        self.assertEqual(request.call_args.args[0], "POST")
+        self.assertEqual(request.call_args.args[2], {"comment": "Thanks."})
+
 
 # -------------------------------------------------------------------------
 # tests/test_pipeline.py
@@ -6124,7 +6172,7 @@ class FakeClassifier:
         self.fail = fail
         self.calls = 0
 
-    def classify(self, body: str, has_attachments: bool) -> ScreeningResult:
+    def classify(self, body: str, has_attachments: bool, reply_guidance: str = "") -> ScreeningResult:
         self.calls += 1
         if self.fail:
             raise ClassificationError("synthetic failure")
@@ -6217,6 +6265,41 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(record.analysis.route, Route.NEEDS_REVIEW)
         self.assertEqual(record.processing_error, "ai_processing_error")
         self.assertIn("AI - Processing Error", record.categories)
+
+    def test_local_preference_can_prefer_no_reply_without_overriding_safety(self):
+        preferences = FeedbackPreferences(
+            (FeedbackPreference("example.org", Route.NO_REPLY, "Keep replies brief."),)
+        )
+        record = process_message(self.message(), FakeClassifier(), 12_000, preferences=preferences)
+        self.assertEqual(record.analysis.route, Route.NO_REPLY)
+        self.assertFalse(record.analysis.response_required)
+        self.assertIsNone(record.analysis.suggested_reply)
+
+    def test_newsletter_is_only_suggested_for_manual_unsubscribe(self):
+        result = needs_reply_result()
+        result = result.__class__(
+            summary=result.summary,
+            priority_score=1,
+            action_items=(),
+            route=Route.NO_REPLY,
+            response_required=False,
+            confidence=result.confidence,
+            urgency=Urgency.ROUTINE,
+            deadline=None,
+            topic=Topic.OTHER,
+            manual_review_reason=None,
+            rationale="Newsletter.",
+            suggested_reply=None,
+        )
+        record = process_message(
+            self.message(
+                sender_address="newsletter@example.org",
+                body="Manage preferences or unsubscribe from this weekly newsletter.",
+            ),
+            FakeClassifier(result),
+            12_000,
+        )
+        self.assertTrue(record.unsubscribe_suggestion)
 
     def test_local_queue_does_not_store_message_body_and_is_idempotent(self):
         record = process_message(self.message(), FakeClassifier(), 12_000)

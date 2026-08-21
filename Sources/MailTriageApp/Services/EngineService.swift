@@ -170,6 +170,7 @@ enum EngineCommandBuilder {
         environment["MAX_BODY_CHARACTERS"] = String(configuration.maxBodyCharacters)
         environment["MAX_RETRIEVAL_PAGES"] = String(configuration.maxRetrievalPages)
         environment["TRIAGE_OUTPUT_DIR"] = configuration.outputDirectory
+        environment["TRIAGE_FEEDBACK_FILE"] = EnginePaths.learningPreferencesFile.path
         environment["EDGE_PROFILE_DIR"] = EnginePaths.edgeProfileDirectory.path
         environment["PYTHONUNBUFFERED"] = "1"
         return environment
