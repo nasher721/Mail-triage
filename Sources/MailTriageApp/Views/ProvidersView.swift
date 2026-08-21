@@ -196,7 +196,9 @@ private struct ProviderCard: View {
 
                 HStack {
                     Button(isExpanded ? "Hide Details" : "Configure", action: toggleExpanded)
-                    Button("Check") { store.checkProvider(provider) }
+                    Button("Check") {
+                        store.checkProvider(provider, role: isSelected ? (isAgentRole ? .agent : .screening) : nil)
+                    }
                     Spacer()
                     if !isSelected {
                         Button("Use for Screening") { store.selectScreeningProvider(provider) }

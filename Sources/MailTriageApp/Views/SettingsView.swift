@@ -38,12 +38,12 @@ struct SettingsView: View {
         .onChange(of: store.overrideTemperature) { _, _ in store.persistSettings() }
         .onChange(of: store.screeningBaseURL) { _, _ in
             store.persistSettings()
-            store.checkProvider(store.screeningProvider)
+            store.checkProvider(store.screeningProvider, role: .screening)
         }
         .onChange(of: store.screeningModel) { _, _ in store.persistSettings() }
         .onChange(of: store.agentBaseURL) { _, _ in
             store.persistSettings()
-            store.checkProvider(store.agentProvider)
+            store.checkProvider(store.agentProvider, role: .agent)
         }
         .onChange(of: store.agentModel) { _, _ in store.persistSettings() }
     }
@@ -172,7 +172,7 @@ struct SettingsView: View {
                     }
                 }
                 Button("Check Local Providers") {
-                    AIProvider.localProviders.forEach(store.checkProvider)
+                    AIProvider.localProviders.forEach { store.checkProvider($0) }
                 }
             }
         }
