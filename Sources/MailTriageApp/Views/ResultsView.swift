@@ -103,6 +103,16 @@ struct ResultsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
+                Button("Select All") {
+                    store.selectAllFilteredForApply()
+                }
+                .buttonStyle(.borderless)
+                .font(.caption)
+                Button("Select None") {
+                    store.selectNoneFilteredForApply()
+                }
+                .buttonStyle(.borderless)
+                .font(.caption)
                 if let date = store.lastRunDate {
                     Text("Run \(date.formatted(date: .omitted, time: .shortened))")
                         .font(.caption)
@@ -119,25 +129,45 @@ struct ResultsView: View {
 }
 
 private struct ResultRow: View {
+    @EnvironmentObject private var store: AppStore
     let record: TriageRecord
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Text(record.subject.isEmpty ? "(No subject)" : record.subject)
-                    .font(.headline)
+        HStack(alignment: .top, spacing: 8) {
+            Toggle(
+                "",
+                isOn: Binding(
+                    get: { store.selectedApplyIDs.contains(record.messageID) },
+                    set: { isOn in
+                        if isOn {
+                            store.selectedApplyIDs.insert(record.messageID)
+                        } else {
+                            store.selectedApplyIDs.remove(record.messageID)
+                        }
+                    }
+                )
+            )
+            .labelsHidden()
+            .toggleStyle(.checkbox)
+            .disabled(record.isApplied)
+
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text(record.subject.isEmpty ? "(No subject)" : record.subject)
+                        .font(.headline)
+                        .lineLimit(1)
+                    Spacer()
+                    PriorityBadge(score: record.analysis.priorityScore)
+                }
+                Text(sender)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
                     .lineLimit(1)
-                Spacer()
-                PriorityBadge(score: record.analysis.priorityScore)
+                Text(record.analysis.summary)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
             }
-            Text(sender)
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-            Text(record.analysis.summary)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .lineLimit(2)
         }
         .padding(.vertical, 5)
     }

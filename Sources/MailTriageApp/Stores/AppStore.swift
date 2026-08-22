@@ -88,6 +88,7 @@ final class AppStore: ObservableObject {
     @Published var routeFilter: RouteFilter = .all
     @Published var resultSearch: String = ""
     @Published var selectedResultID: TriageRecord.ID?
+    @Published var selectedApplyIDs: Set<String> = []
 
     @Published private(set) var diagnostic: DiagnosticReport?
     @Published private(set) var liveProbe: LiveProbeReport?
@@ -109,6 +110,7 @@ final class AppStore: ObservableObject {
     private var currentOperationTask: Task<Void, Never>?
     private var providerCheckTasks: [AIProvider: Task<Void, Never>] = [:]
     private var automationTimer: Timer?
+    private var pendingApplyIdsFile = ""
 
     init(defaults: UserDefaults = .standard, credentials: CredentialStore = CredentialStore()) {
         self.defaults = defaults
@@ -191,14 +193,27 @@ final class AppStore: ObservableObject {
             maxMessages: maxMessages,
             maxBodyCharacters: maxBodyCharacters,
             maxRetrievalPages: maxRetrievalPages,
-            outputDirectory: outputDirectory
+            outputDirectory: outputDirectory,
+            applyIdsFile: runMode == .apply ? pendingApplyIdsFile : ""
         )
+    }
+
+    var selectedApplyCount: Int {
+        ApplySelection.idsForApply(selected: selectedApplyIDs, records: results).count
+    }
+
+    var canApplySelection: Bool {
+        canRun && source.supportsApply && selectedApplyCount > 0
     }
 
     var canRun: Bool {
         !isRunning
             && (!source.needsInputFile || !inputFile.isEmpty)
             && configuration.validationFailure == nil
+    }
+
+    var canStartToolbarRun: Bool {
+        runMode == .apply ? canApplySelection : canRun
     }
 
     /// Why the run button is unavailable, for display next to it.
@@ -480,6 +495,36 @@ final class AppStore: ObservableObject {
 
     // MARK: - Results
 
+    func selectAllFilteredForApply() {
+        selectedApplyIDs = ApplySelection.selectAllFiltered(
+            current: selectedApplyIDs,
+            filtered: filteredResults
+        )
+    }
+
+    func selectNoneFilteredForApply() {
+        selectedApplyIDs = ApplySelection.selectNoneFiltered(
+            current: selectedApplyIDs,
+            filtered: filteredResults
+        )
+    }
+
+    func writeApplyIdsFile() throws -> String {
+        let ids = ApplySelection.idsForApply(selected: selectedApplyIDs, records: results)
+        guard !ids.isEmpty else {
+            throw EngineFailure.launchFailed("Select at least one previewed message to apply.")
+        }
+        if ids.count > 200 {
+            throw EngineFailure.launchFailed("Select at most 200 messages to apply.")
+        }
+        let directory = URL(fileURLWithPath: outputDirectory, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = directory.appendingPathComponent("apply-ids.json")
+        try ApplySelection.jsonDocument(messageIDs: ids).write(to: url, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        return url.path
+    }
+
     var filteredResults: [TriageRecord] {
         let query = resultSearch.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return results.filter { record in
@@ -651,6 +696,17 @@ final class AppStore: ObservableObject {
 
     func runTriage(using override: EngineConfiguration? = nil) {
         persistSettings()
+        let effectiveRunMode = override?.runMode ?? runMode
+        if effectiveRunMode == .apply {
+            do {
+                pendingApplyIdsFile = try writeApplyIdsFile()
+            } catch {
+                handle(error)
+                return
+            }
+        } else {
+            pendingApplyIdsFile = ""
+        }
         let configuration = override ?? self.configuration
         let providerLabel = useAgent && useSeparateAgentProvider
             ? "\(screeningProvider.title) + \(agentProvider.title)"
@@ -665,8 +721,14 @@ final class AppStore: ObservableObject {
             self.appendProcessOutput(output)
             do {
                 let newRecords = try EngineParser.records(from: output.stdout)
-                self.results = newRecords
-                self.selectedResultID = newRecords.first?.id
+                if configuration.runMode == .apply {
+                    self.results = ApplySelection.merge(existing: self.results, applied: newRecords)
+                    self.selectedApplyIDs.subtract(self.results.filter(\.isApplied).map(\.messageID))
+                } else {
+                    self.results = newRecords
+                    self.selectedApplyIDs = Set(newRecords.filter { !$0.isApplied }.map(\.messageID))
+                    self.selectedResultID = newRecords.first?.id
+                }
                 self.selection = .results
                 self.lastRunDate = Date()
                 let kind: ActivityEntry.Kind = output.status == 0 ? .success : .warning

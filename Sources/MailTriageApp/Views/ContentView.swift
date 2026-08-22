@@ -26,7 +26,7 @@ struct ContentView: View {
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("Mail Triage never sends, forwards, or deletes messages. It may move messages, add categories, save unsent drafts, and optionally mark filed messages read.")
+            Text("Mail Triage will update \(store.selectedApplyCount) message(s). It never sends, forwards, or deletes. It may move messages, add categories, save unsent drafts, and optionally mark filed messages read. Unchecked mail stays in Inbox.")
         }
     }
 
@@ -70,7 +70,7 @@ struct ContentView: View {
                     )
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(!store.canRun)
+                .disabled(!store.canStartToolbarRun)
                 .help(store.runBlockedReason ?? "Run Mail Triage (Command-R)")
             }
         }
