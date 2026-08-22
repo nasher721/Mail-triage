@@ -1,7 +1,16 @@
 import unittest
 from datetime import datetime, timezone
 
-from email_triage.models import Confidence, ReviewRecord, Route, ScreeningResult, Topic, Urgency
+from email_triage.models import (
+    Confidence,
+    ReviewRecord,
+    Route,
+    ScreeningResult,
+    Topic,
+    Urgency,
+    normalize_reply_closing,
+    use_reply_closing,
+)
 
 
 class ModelTests(unittest.TestCase):
@@ -32,6 +41,35 @@ class ModelTests(unittest.TestCase):
             ScreeningResult.from_dict(
                 self.valid(route="needs_reply", response_required=True, suggested_reply="Thanks.")
             )
+
+    def test_custom_reply_closing_is_accepted(self):
+        payload = self.valid(
+            route="needs_reply",
+            response_required=True,
+            suggested_reply="Thanks.\n\nRegards,\nAlex",
+        )
+        with use_reply_closing("Regards,\nAlex"):
+            result = ScreeningResult.from_dict(payload)
+        self.assertTrue(result.suggested_reply.endswith("Regards,\nAlex"))
+
+    def test_custom_reply_closing_rejects_mismatch(self):
+        payload = self.valid(
+            route="needs_reply",
+            response_required=True,
+            suggested_reply="Thanks.\n\nBest,\nNick",
+        )
+        with use_reply_closing("Regards,\nAlex"):
+            with self.assertRaises(ValueError):
+                ScreeningResult.from_dict(payload)
+
+    def test_reply_closing_bounds(self):
+        self.assertEqual(normalize_reply_closing("  "), "Best,\nNick")
+        with self.assertRaises(ValueError):
+            normalize_reply_closing("x" * 121)
+        with self.assertRaises(ValueError):
+            normalize_reply_closing("a\nb\nc\nd\ne")
+        with self.assertRaises(ValueError):
+            normalize_reply_closing("Best,<b>Nick</b>")
 
     def test_non_reply_route_cannot_contain_reply(self):
         with self.assertRaises(ValueError):

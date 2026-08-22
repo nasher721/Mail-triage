@@ -79,6 +79,7 @@ final class AppStore: ObservableObject {
     @Published var maxBodyCharacters: Int
     @Published var maxRetrievalPages: Int
     @Published var outputDirectory: String
+    @Published var replyClosing: String
 
     // Automation
     @Published var automationEnabled: Bool
@@ -147,6 +148,7 @@ final class AppStore: ObservableObject {
         maxRetrievalPages = max(1, defaults.object(forKey: "maxRetrievalPages") as? Int ?? 10)
         outputDirectory = defaults.string(forKey: "outputDirectory")
             ?? EnginePaths.defaultOutputDirectory.path
+        replyClosing = defaults.string(forKey: "replyClosing") ?? ReplyClosing.defaultValue
         automationEnabled = defaults.bool(forKey: "automationEnabled")
         automationMinutes = max(5, defaults.object(forKey: "automationMinutes") as? Int ?? 30)
 
@@ -194,7 +196,8 @@ final class AppStore: ObservableObject {
             maxBodyCharacters: maxBodyCharacters,
             maxRetrievalPages: maxRetrievalPages,
             outputDirectory: outputDirectory,
-            applyIdsFile: runMode == .apply ? pendingApplyIdsFile : ""
+            applyIdsFile: runMode == .apply ? pendingApplyIdsFile : "",
+            replyClosing: replyClosing
         )
     }
 
@@ -249,6 +252,7 @@ final class AppStore: ObservableObject {
         defaults.set(maxBodyCharacters, forKey: "maxBodyCharacters")
         defaults.set(maxRetrievalPages, forKey: "maxRetrievalPages")
         defaults.set(outputDirectory, forKey: "outputDirectory")
+        defaults.set(replyClosing, forKey: "replyClosing")
         defaults.set(automationEnabled, forKey: "automationEnabled")
         defaults.set(automationMinutes, forKey: "automationMinutes")
     }
@@ -638,6 +642,23 @@ final class AppStore: ObservableObject {
             showApplyConfirmation = true
         } else {
             runTriage()
+        }
+    }
+
+    func ensureOrganizationFolders() {
+        guard source.supportsApply else { return }
+        launch(label: "Creating AI Triage organization folders") {
+            try EngineCommandBuilder.ensureFolders(self.configuration)
+        } completion: { output in
+            self.appendProcessOutput(output)
+            if output.status == 0 {
+                self.activity.insert(
+                    ActivityEntry("AI Triage folders are ready in Outlook.", kind: .success),
+                    at: 0
+                )
+            } else {
+                self.presentFailure(output, operation: "Create folders")
+            }
         }
     }
 

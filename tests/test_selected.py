@@ -81,6 +81,10 @@ class ApplySelectedTests(unittest.TestCase):
         self.assertTrue(any(call[0] == "move_message" for call in mailbox.calls))
         moved_ids = [call[1] for call in mailbox.calls if call[0] == "move_message"]
         self.assertEqual(moved_ids, ["message-1"])
+        self.assertGreaterEqual(
+            len([call for call in mailbox.calls if call[0] == "ensure_folder_path"]),
+            6,
+        )
 
     def test_missing_id_fails_and_continues(self) -> None:
         record = needs_reply_record()
@@ -149,7 +153,8 @@ class ApplySelectedTests(unittest.TestCase):
                 mark_read=False,
             )
         self.assertEqual((emitted, failures), (1, 1))
-        self.assertEqual(mailbox.calls, [])
+        self.assertTrue(all(call[0] == "ensure_folder_path" for call in mailbox.calls))
+        self.assertFalse(any(call[0] == "move_message" for call in mailbox.calls))
 
     def test_mailbox_404_fails_that_row(self) -> None:
         record = needs_reply_record()

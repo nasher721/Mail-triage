@@ -142,6 +142,7 @@ def agent_briefing(record: ReviewRecord) -> str:
             },
             "screening_categories": list(record.categories),
             "recommended_folder": record.target_folder,
+            "permitted_folders": list(permitted_folders(record)),
             "reply_draft_available": may_draft_reply(record),
         },
         ensure_ascii=False,

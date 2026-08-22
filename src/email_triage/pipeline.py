@@ -8,6 +8,7 @@ from typing import Any, Protocol
 
 from email_triage.classifier import ClassificationError
 from email_triage.feedback import FeedbackPreferences
+from email_triage.folders import TOPIC_CATEGORIES, URGENCY_CATEGORIES, cleanup_folder
 from email_triage.models import (
     Confidence,
     GraphMessage,
@@ -19,29 +20,6 @@ from email_triage.models import (
     Urgency,
 )
 from email_triage.safety import body_to_text, local_manual_review_reason
-
-
-FOLDER_NAMES = {
-    Route.NEEDS_REVIEW: "AI Triage/Needs Review",
-    Route.NEEDS_REPLY: "AI Triage/Needs Reply",
-    Route.NO_REPLY: "AI Triage/No Reply Needed",
-}
-
-NEWSLETTER_FOLDER = "AI Triage/Newsletters"
-READING_FOLDER = "AI Triage/Read Later"
-ADMIN_FOLDER = "AI Triage/Administrative"
-URGENCY_CATEGORIES = {
-    Urgency.URGENT: "AI - Urgent",
-    Urgency.SOON: "AI - Soon",
-    Urgency.ROUTINE: "AI - Routine",
-}
-TOPIC_CATEGORIES = {
-    Topic.CLINICAL: "AI - Clinical",
-    Topic.SCHEDULING: "AI - Scheduling",
-    Topic.ADMINISTRATIVE: "AI - Administrative",
-    Topic.EDUCATION_RESEARCH: "AI - Education/Research",
-    Topic.OTHER: "AI - Other",
-}
 
 
 class Classifier(Protocol):
@@ -61,20 +39,6 @@ def suggest_unsubscribe(message: GraphMessage, body: str, result: ScreeningResul
         token in text for token in ("newsletter", "weekly digest", "promotions", "subscribe")
     )
     return has_opt_out and has_newsletter_signal
-
-
-def cleanup_folder(result: ScreeningResult, unsubscribe_suggestion: bool) -> str:
-    """Choose a reviewable subfolder for messages that need no reply."""
-
-    if result.route != Route.NO_REPLY:
-        return FOLDER_NAMES[result.route]
-    if unsubscribe_suggestion:
-        return NEWSLETTER_FOLDER
-    if result.topic == Topic.EDUCATION_RESEARCH:
-        return READING_FOLDER
-    if result.topic == Topic.ADMINISTRATIVE:
-        return ADMIN_FOLDER
-    return FOLDER_NAMES[Route.NO_REPLY]
 
 
 def _manual_review(reason: ManualReviewReason, processing_error: bool = False) -> ScreeningResult:

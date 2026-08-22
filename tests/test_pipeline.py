@@ -65,7 +65,7 @@ class PipelineTests(unittest.TestCase):
         record = process_message(self.message(), FakeClassifier(), 12_000)
         self.assertIsNotNone(record)
         self.assertEqual(record.analysis.route, Route.NEEDS_REPLY)
-        self.assertEqual(record.target_folder, "AI Triage/Needs Reply")
+        self.assertEqual(record.target_folder, "AI Triage/Needs Reply/Scheduling")
         self.assertTrue(record.analysis.suggested_reply.endswith("Best,\nNick"))
 
     def test_no_reply_sender_is_forced_to_no_reply(self):
@@ -161,7 +161,7 @@ class PipelineTests(unittest.TestCase):
             12_000,
             preferences=preferences,
         )
-        self.assertEqual(record.target_folder, "AI Triage/Needs Review")
+        self.assertEqual(record.target_folder, "AI Triage/Needs Review/Clinical")
 
     def test_invalid_preference_destination_is_not_loaded(self):
         with tempfile.TemporaryDirectory() as directory:

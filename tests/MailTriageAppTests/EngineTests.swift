@@ -95,6 +95,30 @@ private func hosted(
     #expect(object?["message_ids"] as? [String] == ["m1", "m2"])
 }
 
+@Test func replyClosingIsForwardedAndValidated() throws {
+    var configured = configuration
+    configured.replyClosing = "Regards,\nAlex"
+    let command = try EngineCommandBuilder.triage(configured)
+    #expect(command.environment["TRIAGE_REPLY_CLOSING"] == "Regards,\nAlex")
+
+    configured.replyClosing = "<b>Nick</b>"
+    #expect(configured.validationFailure != nil)
+}
+
+@Test func ensureFoldersCommandIsWriteOnlyAndLiteral() throws {
+    let command = try EngineCommandBuilder.ensureFolders(configuration)
+    #expect(command.arguments.contains("--ensure-folders"))
+    #expect(command.arguments.contains("--non-interactive"))
+    #expect(!command.arguments.contains("--apply-ids-file"))
+
+    var local = configuration
+    local.source = .local
+    local.inputFile = "/tmp/mail.eml"
+    #expect(throws: EngineFailure.self) {
+        try EngineCommandBuilder.ensureFolders(local)
+    }
+}
+
 @Test func applyCommandRequiresIdsFileAndForwardsPathLiterally() throws {
     var apply = configuration
     apply.runMode = .apply

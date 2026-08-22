@@ -51,6 +51,39 @@ class ApplyIdsCliTests(unittest.TestCase):
         with patch("sys.argv", ["email-triage", "--owa", "--apply-ids-file", "/tmp/ids.json"]):
             self.assertEqual(main(), 2)
 
+    def test_parser_accepts_ensure_folders(self) -> None:
+        args = build_parser().parse_args(["--source", "owa", "--ensure-folders"])
+        self.assertTrue(args.ensure_folders)
+
+    def test_ensure_folders_rejects_watch_and_local(self) -> None:
+        with patch("sys.argv", ["email-triage", "--owa", "--ensure-folders", "--watch", "30"]):
+            self.assertEqual(main(), 2)
+        args = build_parser().parse_args(
+            ["--source", "local", "--input", "samples/inbox.jsonl", "--ensure-folders"]
+        )
+        with patch.dict("os.environ", {"TRIAGE_PROVIDER": "ollama"}, clear=False):
+            with self.assertRaises(ConfigurationError):
+                run(args)
+
+    def test_ensure_folders_creates_tree_without_classifier(self) -> None:
+        args = build_parser().parse_args(["--source", "graph", "--ensure-folders", "--non-interactive"])
+        with (
+            patch("email_triage.cli.Settings.from_env") as settings_from_env,
+            patch("email_triage.cli.GraphMailbox") as mailbox_cls,
+            patch("email_triage.cli.build_classifier") as build_classifier,
+        ):
+            settings = settings_from_env.return_value
+            settings.mailbox_source = "graph"
+            settings.tenant_id = "t"
+            settings.client_id = "c"
+            settings.output_dir = Path("/tmp")
+            settings.max_retrieval_pages = 10
+            mailbox_cls.return_value.ensure_folder_path.side_effect = lambda path: path
+            code = run(args)
+        self.assertEqual(code, 0)
+        self.assertGreater(mailbox_cls.return_value.ensure_folder_path.call_count, 5)
+        build_classifier.assert_not_called()
+
     def test_apply_ids_skips_classifier_and_unread_scan(self) -> None:
         args = build_parser().parse_args(
             ["--source", "graph", "--apply", "--apply-ids-file", "/tmp/ids.json", "--non-interactive"]

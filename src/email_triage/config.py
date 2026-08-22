@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
+from email_triage.models import DEFAULT_REPLY_CLOSING, normalize_reply_closing
 from email_triage.providers import (
     PROVIDER_NAMES,
     ProviderProfile,
@@ -176,6 +177,7 @@ class Settings:
     apply_changes: bool = False
     mark_read: bool = False
     use_agent: bool = True
+    reply_closing: str = DEFAULT_REPLY_CLOSING
 
     @property
     def ai_provider(self) -> str:
@@ -326,6 +328,10 @@ class Settings:
             raise ConfigurationError(
                 "The macOS Outlook desktop adapter cannot mark messages read."
             )
+        try:
+            reply_closing = normalize_reply_closing(os.getenv("TRIAGE_REPLY_CLOSING"))
+        except ValueError as exc:
+            raise ConfigurationError(str(exc)) from exc
         owa_cdp_url = (
             os.getenv("EDGE_CDP_URL", "").strip()
             or os.getenv("OWA_CDP_URL", "").strip()
@@ -359,4 +365,5 @@ class Settings:
             apply_changes=apply_enabled,
             mark_read=mark_read_enabled,
             use_agent=agent_enabled,
+            reply_closing=reply_closing,
         )

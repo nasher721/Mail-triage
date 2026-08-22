@@ -59,6 +59,9 @@ struct MailTriageApp: App {
                 .keyboardShortcut("r", modifiers: [.command, .shift])
                 .disabled(!store.canApplySelection)
 
+                Button("Create Organization Folders") { store.ensureOrganizationFolders() }
+                    .disabled(store.isRunning || !store.source.supportsApply)
+
                 Button("Run Diagnostics") { store.runDiagnostic() }
                     .keyboardShortcut("d", modifiers: [.command, .shift])
                     .disabled(store.isRunning)

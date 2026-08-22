@@ -68,6 +68,15 @@ struct OverviewView: View {
             )
 
             StatusCard(
+                title: "Organization Folders",
+                detail: "Create the AI Triage route and topic folders in Outlook before filing.",
+                symbol: "folder.badge.plus",
+                state: store.source.supportsApply ? .ready : .warning,
+                actionTitle: "Create Folders",
+                action: store.ensureOrganizationFolders
+            )
+
+            StatusCard(
                 title: "Run Mode",
                 detail: store.runMode == .preview
                     ? "Preview only—no mailbox changes"

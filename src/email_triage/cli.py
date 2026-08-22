@@ -18,6 +18,7 @@ from email_triage.backends import backend_capabilities
 from email_triage.classifier import build_classifier
 from email_triage.config import ConfigurationError, Settings
 from email_triage.feedback import FeedbackPreferences
+from email_triage.folders import ensure_organization_folders
 from email_triage.providers import PROVIDER_NAMES, describe_providers
 from email_triage.desktop import OutlookDesktopMailbox, desktop_diagnostic
 from email_triage.graph import GraphError, GraphMailbox
@@ -137,6 +138,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Write to the mailbox: move messages into AI Triage folders, apply categories, "
             "and save unsent reply drafts. Without this flag the plan is only previewed."
+        ),
+    )
+    parser.add_argument(
+        "--ensure-folders",
+        action="store_true",
+        help=(
+            "Create the AI Triage organization folder tree in Outlook and exit. "
+            "Does not read mail or call a model. Valid only with --source owa or graph."
         ),
     )
     parser.add_argument(
@@ -314,6 +323,32 @@ def run(args: argparse.Namespace) -> int:
         )
         return 0
 
+    if args.ensure_folders:
+        if settings.mailbox_source not in {"owa", "graph"}:
+            raise ConfigurationError("--ensure-folders supports only --source owa or graph")
+        if settings.mailbox_source == "owa":
+            mailbox = OwaMailbox(
+                settings.owa_cdp_url,
+                read_write=True,
+                max_scan_pages=settings.max_retrieval_pages,
+            )
+        else:
+            mailbox = GraphMailbox(
+                settings.tenant_id,
+                settings.client_id,
+                settings.output_dir / "oauth_token_cache.json",
+                read_write=True,
+                interactive=interactive,
+                max_scan_pages=settings.max_retrieval_pages,
+            )
+        folders = ensure_organization_folders(mailbox)
+        print(json.dumps({"folders": list(folders), "mailbox_mutated": True}, sort_keys=True))
+        print(
+            f"Created or verified {len(folders)} AI Triage folders. Mail was not sent.",
+            file=sys.stderr,
+        )
+        return 0
+
     if args.apply_ids_file:
         if settings.mailbox_source not in {"owa", "graph"}:
             raise ConfigurationError("--apply-ids-file supports only --source owa or graph")
@@ -413,6 +448,7 @@ def run(args: argparse.Namespace) -> int:
 
     actuator: GraphActuator | DryRunActuator
     if settings.apply_changes and live_mailbox is not None:
+        ensure_organization_folders(live_mailbox)
         actuator = GraphActuator(live_mailbox)
         print(
             "Apply mode: messages will be moved, categorized, and given unsent reply "
@@ -545,6 +581,13 @@ def main(argv: list[str] | None = None) -> int:
             if watch_seconds is not None:
                 raise ConfigurationError(
                     "--apply-ids-file cannot be combined with --watch"
+                )
+        if getattr(args, "ensure_folders", False):
+            if watch_seconds is not None:
+                raise ConfigurationError("--ensure-folders cannot be combined with --watch")
+            if getattr(args, "apply_ids_file", None):
+                raise ConfigurationError(
+                    "--ensure-folders cannot be combined with --apply-ids-file"
                 )
         while True:
             try:
