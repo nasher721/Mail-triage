@@ -11,13 +11,16 @@ from test_actions import needs_reply_record
 
 
 class FakeGraphMailbox:
-    def __init__(self, fail_on: str | None = None):
+    def __init__(self, fail_on: str | None = None, error: GraphError | None = None):
         self.fail_on = fail_on
+        self.error = error
         self.calls: list[tuple] = []
         self.folders = {"AI Triage/Needs Reply": "folder-1"}
 
     def _maybe_fail(self, name: str) -> None:
         if self.fail_on == name:
+            if self.error is not None:
+                raise self.error
             raise GraphError(f"synthetic {name} failure")
 
     def create_reply_draft(self, message_id: str, reply_text: str) -> str:
@@ -65,13 +68,28 @@ class ApplyTests(unittest.TestCase):
 
     def test_failure_stops_the_remaining_plan(self) -> None:
         record = needs_reply_record()
-        mailbox = FakeGraphMailbox(fail_on="create_reply_draft")
+        mailbox = FakeGraphMailbox(
+            fail_on="create_reply_draft",
+            error=GraphError("message gone", status=404, code="ErrorItemNotFound"),
+        )
         applied = apply_plan(
             record, default_plan(record, allow_mark_read=False), GraphActuator(mailbox)
         )
         self.assertEqual(len(applied), 1)
         self.assertEqual(applied[0].status, "failed")
         self.assertEqual(mailbox.calls, [])
+
+    def test_backend_graph_error_is_not_swallowed(self) -> None:
+        record = needs_reply_record()
+        mailbox = FakeGraphMailbox(
+            fail_on="create_reply_draft",
+            error=GraphError("session expired", status=401, operation="POST"),
+        )
+        with self.assertRaises(GraphError) as caught:
+            apply_plan(
+                record, default_plan(record, allow_mark_read=False), GraphActuator(mailbox)
+            )
+        self.assertEqual(caught.exception.status, 401)
 
     def test_moved_identifier_is_reused_for_later_actions(self) -> None:
         record = needs_reply_record()

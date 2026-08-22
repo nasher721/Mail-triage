@@ -42,6 +42,12 @@ class GraphParsingTests(unittest.TestCase):
         self.assertTrue(message.has_attachments)
         self.assertEqual(message.sensitivity, "private")
 
+    def test_missing_item_is_distinguished_from_backend_errors(self) -> None:
+        self.assertTrue(GraphError("gone", status=404).is_missing_item())
+        self.assertTrue(GraphError("gone", code="ErrorItemNotFound").is_missing_item())
+        self.assertFalse(GraphError("auth", status=401).is_missing_item())
+        self.assertFalse(GraphError("session dropped").is_missing_item())
+
 
 class GraphHardeningTests(unittest.TestCase):
     def mailbox(self, max_scan_pages: int = 10) -> GraphMailbox:

@@ -10,7 +10,10 @@ enum ApplySelection {
     }
 
     static func merge(existing: [TriageRecord], applied: [TriageRecord]) -> [TriageRecord] {
-        let updates = Dictionary(uniqueKeysWithValues: applied.map { ($0.messageID, $0) })
+        var updates: [String: TriageRecord] = [:]
+        for record in applied {
+            updates[record.messageID] = record
+        }
         return existing.map { updates[$0.messageID] ?? $0 }
     }
 

@@ -111,6 +111,8 @@ def apply_plan(
         try:
             detail = actuator.execute(record.message_id, action)
         except GraphError as exc:
+            if not exc.is_missing_item():
+                raise
             applied.append(
                 AppliedAction(action.kind, action.describe(), "failed", str(exc))
             )

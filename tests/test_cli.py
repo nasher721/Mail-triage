@@ -47,6 +47,10 @@ class ApplyIdsCliTests(unittest.TestCase):
         with patch("sys.argv", ["email-triage", "--owa", "--apply", "--apply-ids-file", "x", "--watch", "30"]):
             self.assertEqual(main(), 2)
 
+    def test_apply_ids_file_without_apply_exits_2(self) -> None:
+        with patch("sys.argv", ["email-triage", "--owa", "--apply-ids-file", "/tmp/ids.json"]):
+            self.assertEqual(main(), 2)
+
     def test_apply_ids_skips_classifier_and_unread_scan(self) -> None:
         args = build_parser().parse_args(
             ["--source", "graph", "--apply", "--apply-ids-file", "/tmp/ids.json", "--non-interactive"]

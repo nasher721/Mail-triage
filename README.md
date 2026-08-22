@@ -223,7 +223,7 @@ Also mark filed mail as read (never applied to `needs_review` messages):
 email-triage --apply --mark-read
 ```
 
-`--apply-ids-file PATH` applies a previously previewed subset (JSON `message_ids`, max 200) without re-screening; requires `--apply` and `--source owa` or `graph`.
+`--apply-ids-file PATH` applies a previously previewed subset (JSON `message_ids`, max 200, no duplicates) without re-screening; requires `--apply` and `--source owa` or `graph`. A missing ID or mailbox 404 fails that row and continues (exit `1` if any row failed). Session or other backend errors abort and exit `2`.
 
 Other flags: `--no-agent` uses the deterministic plan only; `--include-previously-processed` re-screens message IDs already in the local state file.
 

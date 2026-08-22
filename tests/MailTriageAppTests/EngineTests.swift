@@ -81,6 +81,14 @@ private func hosted(
     #expect(!merged[1].isApplied)
 }
 
+@Test func applyMergeKeepsLastDuplicateAppliedRow() throws {
+    let existing = [try record(id: "a", status: "planned")]
+    let applied = [try record(id: "a", status: "failed"), try record(id: "a", status: "applied")]
+    let merged = ApplySelection.merge(existing: existing, applied: applied)
+    #expect(merged.count == 1)
+    #expect(merged[0].isApplied)
+}
+
 @Test func applyIdsJSONUsesSnakeCaseMessageIds() throws {
     let data = try ApplySelection.jsonDocument(messageIDs: ["m1", "m2"])
     let object = try JSONSerialization.jsonObject(with: data) as? [String: Any]
@@ -237,6 +245,14 @@ private func hosted(
     #expect(report.capabilities.source == "owa")
     #expect(report.capabilities.supportsApply)
     #expect(report.readiness.code == "cdp_unreachable")
+}
+
+@Test func recordParserAcceptsApplyFailureStub() throws {
+    let line = #"{"message_id":"missing","subject":"","sender_name":"","sender_address":"","target_folder":"","categories":[],"analysis":{"route":"needs_review","urgency":"routine","topic":"other","confidence":"low","priority_score":1,"summary":"Apply could not use a stored review record.","action_items":[],"suggested_reply":null,"manual_review_reason":"low_confidence","deadline":null},"unsubscribe_suggestion":false,"plan_source":"stored","actions":[{"kind":"file_message","description":"apply stored plan","status":"failed","detail":"message was not in the review queue"}]}"#
+    let records = try EngineParser.records(from: line)
+    #expect(records.count == 1)
+    #expect(records[0].messageID == "missing")
+    #expect(!records[0].isApplied)
 }
 
 @Test func recordParserDecodesJSONLines() throws {

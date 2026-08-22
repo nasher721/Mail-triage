@@ -36,6 +36,17 @@ class GraphError(RuntimeError):
             "message": str(self),
         }
 
+    def is_missing_item(self) -> bool:
+        """True when one mailbox item is gone; other Graph errors are backend failures."""
+
+        if self.status == 404:
+            return True
+        return (self.code or "").casefold() in {
+            "erroritemnotfound",
+            "itemnotfound",
+            "errorinvalidmailboxitemid",
+        }
+
 
 class GraphMailbox:
     def __init__(self, tenant_id: str, client_id: str, cache_path: Path, read_write: bool = False,
