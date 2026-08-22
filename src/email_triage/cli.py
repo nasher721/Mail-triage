@@ -26,6 +26,7 @@ from email_triage.live_probe import run_live_probe
 from email_triage.owa import OwaMailbox, edge_debug_available
 from email_triage.pipeline import LocalQueue, process_message
 from email_triage.runtime import LockBusy, is_interactive, load_env_file, single_instance_lock
+from email_triage.selected import apply_selected, load_apply_ids
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -128,6 +129,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Write to the mailbox: move messages into AI Triage folders, apply categories, "
             "and save unsent reply drafts. Without this flag the plan is only previewed."
+        ),
+    )
+    parser.add_argument(
+        "--apply-ids-file",
+        help=(
+            "JSON file {\"message_ids\": [...]} of already-screened message IDs to apply. "
+            "Requires --apply. Does not re-read unread mail or call a model. "
+            "Valid only with --source owa or graph."
         ),
     )
     parser.add_argument(
@@ -296,6 +305,33 @@ def run(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 0
+
+    if args.apply_ids_file:
+        if settings.mailbox_source not in {"owa", "graph"}:
+            raise ConfigurationError("--apply-ids-file supports only --source owa or graph")
+        if not settings.apply_changes:
+            raise ConfigurationError("--apply-ids-file requires --apply")
+        ids = load_apply_ids(Path(args.apply_ids_file).expanduser())
+        if settings.mailbox_source == "owa":
+            mailbox = OwaMailbox(
+                settings.owa_cdp_url,
+                read_write=True,
+                max_scan_pages=settings.max_retrieval_pages,
+            )
+        else:
+            mailbox = _build_graph_mailbox(settings, interactive)
+        actuator = GraphActuator(mailbox)
+        _emitted, failures = apply_selected(
+            output_dir=settings.output_dir,
+            ids=ids,
+            actuator=actuator,
+            mark_read=settings.mark_read,
+        )
+        print(
+            "Mailbox updated for selected messages; no mail was sent, forwarded, or deleted.",
+            file=sys.stderr,
+        )
+        return 1 if failures else 0
 
     live_mailbox: GraphMailbox | OwaMailbox | None = None
     if settings.mailbox_source == "local":
@@ -491,6 +527,13 @@ def main(argv: list[str] | None = None) -> int:
             agent_provider=args.agent_provider,
             agent_model=args.agent_model,
         )
+        if getattr(args, "apply_ids_file", None):
+            if not args.apply:
+                raise ConfigurationError("--apply-ids-file requires --apply")
+            if watch_seconds is not None:
+                raise ConfigurationError(
+                    "--apply-ids-file cannot be combined with --watch"
+                )
         while True:
             try:
                 with single_instance_lock(output_dir / "triage.lock"):

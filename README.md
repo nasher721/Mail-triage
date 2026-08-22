@@ -223,6 +223,8 @@ Also mark filed mail as read (never applied to `needs_review` messages):
 email-triage --apply --mark-read
 ```
 
+`--apply-ids-file PATH` applies a previously previewed subset (JSON `message_ids`, max 200) without re-screening; requires `--apply` and `--source owa` or `graph`.
+
 Other flags: `--no-agent` uses the deterministic plan only; `--include-previously-processed` re-screens message IDs already in the local state file.
 
 Each processed message prints one JSON line containing the screening result, `plan_source`, and the action outcomes. Exit codes: `0` success (or a skipped run because another copy holds the lock), `1` at least one action failed, `2` configuration or Graph error.
