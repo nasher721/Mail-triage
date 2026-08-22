@@ -214,5 +214,24 @@ class PipelineTests(unittest.TestCase):
             )
 
 
+class QueuePayloadTests(PipelineTests):
+    def test_append_extra_fields_and_latest_wins(self) -> None:
+        record = process_message(self.message(), FakeClassifier(), 12_000)
+        with tempfile.TemporaryDirectory() as directory:
+            queue = LocalQueue(Path(directory))
+            queue.append(record, extra={"plan_source": "agent", "actions": []})
+            queue.append(record, extra={"plan_source": "deterministic", "actions": [{"kind": "file_message"}]})
+            (Path(directory) / "review_queue.jsonl").write_text(
+                (Path(directory) / "review_queue.jsonl").read_text(encoding="utf-8")
+                + "not-json\n",
+                encoding="utf-8",
+            )
+            payloads = queue.latest_payloads()
+        self.assertEqual(set(payloads), {"message-1"})
+        self.assertEqual(payloads["message-1"]["plan_source"], "deterministic")
+        self.assertEqual(payloads["message-1"]["actions"][0]["kind"], "file_message")
+        self.assertNotIn("Can we meet", json.dumps(payloads["message-1"]))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -4,7 +4,7 @@ import json
 import os
 from dataclasses import replace
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from email_triage.classifier import ClassificationError
 from email_triage.feedback import FeedbackPreferences
@@ -248,10 +248,13 @@ class LocalQueue:
 
         return set(self._seen)
 
-    def append(self, record: ReviewRecord) -> None:
+    def append(self, record: ReviewRecord, extra: dict[str, Any] | None = None) -> None:
         self._prepare()
+        payload = record.to_dict()
+        if extra:
+            payload.update(extra)
         with self.queue_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record.to_dict(), ensure_ascii=False) + "\n")
+            handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
         os.chmod(self.queue_path, 0o600)
         self._seen.add(record.message_id)
         self.state_path.write_text(
@@ -259,3 +262,25 @@ class LocalQueue:
             encoding="utf-8",
         )
         os.chmod(self.state_path, 0o600)
+
+    def latest_payloads(self) -> dict[str, dict[str, Any]]:
+        if not self.queue_path.is_file():
+            return {}
+        latest: dict[str, dict[str, Any]] = {}
+        try:
+            lines = self.queue_path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return {}
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            message_id = payload.get("message_id")
+            if isinstance(message_id, str) and message_id:
+                latest[message_id] = payload
+        return latest
