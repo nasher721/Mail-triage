@@ -1,9 +1,45 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Iterator
+
+DEFAULT_REPLY_CLOSING = "Best,\nNick"
+_REPLY_CLOSING: ContextVar[str] = ContextVar("reply_closing", default=DEFAULT_REPLY_CLOSING)
+
+
+def normalize_reply_closing(value: str | None) -> str:
+    """Return a safe operator-authored sign-off, or the default when empty."""
+
+    text = (value or "").strip()
+    if not text:
+        return DEFAULT_REPLY_CLOSING
+    if len(text) > 120:
+        raise ValueError("reply closing must be at most 120 characters")
+    if text.count("\n") > 3 or len(text.splitlines()) > 4:
+        raise ValueError("reply closing must be at most four lines")
+    if any(ord(character) < 32 and character != "\n" for character in text):
+        raise ValueError("reply closing may only use newline as a control character")
+    if "<" in text or ">" in text:
+        raise ValueError("reply closing cannot contain HTML")
+    return text
+
+
+def current_reply_closing() -> str:
+    return _REPLY_CLOSING.get()
+
+
+@contextmanager
+def use_reply_closing(value: str | None) -> Iterator[str]:
+    closing = normalize_reply_closing(value)
+    token = _REPLY_CLOSING.set(closing)
+    try:
+        yield closing
+    finally:
+        _REPLY_CLOSING.reset(token)
 
 
 class Route(StrEnum):
@@ -101,10 +137,9 @@ class ScreeningResult:
         if self.route == Route.NEEDS_REPLY:
             if not self.response_required or self.confidence == Confidence.LOW:
                 raise ValueError("needs_reply requires a response and non-low confidence")
-            if not self.suggested_reply or not self.suggested_reply.rstrip().endswith(
-                "Best,\nNick"
-            ):
-                raise ValueError("suggested replies must end with 'Best,\\nNick'")
+            closing = current_reply_closing()
+            if not self.suggested_reply or not self.suggested_reply.rstrip().endswith(closing):
+                raise ValueError(f"suggested replies must end with {closing!r}")
         elif self.suggested_reply is not None:
             raise ValueError("only needs_reply results may contain a suggested reply")
 

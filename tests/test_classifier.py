@@ -124,6 +124,22 @@ class ClassifierTests(unittest.TestCase):
         self.assertEqual(classifier.model, "qwen3:8b")
         self.assertEqual(classifier.provider, "ollama")
 
+    def test_custom_closing_is_injected_into_screening_instructions(self) -> None:
+        captured = {}
+        custom = dict(RESULT)
+        custom["suggested_reply"] = "Tuesday afternoon works for me.\n\nRegards,\nAlex"
+
+        def fake_urlopen(request, timeout=None):
+            captured["payload"] = json.loads(request.data)
+            return io.BytesIO(json.dumps({"message": {"content": json.dumps(custom)}}).encode())
+
+        classifier = classifier_for("ollama")
+        classifier.reply_closing = "Regards,\nAlex"
+        with patch("email_triage.providers.urlopen", fake_urlopen):
+            result = classifier.classify("Can we meet next Tuesday?", False)
+        self.assertIn("Regards,\\nAlex", captured["payload"]["messages"][0]["content"])
+        self.assertTrue(result.suggested_reply.endswith("Regards,\nAlex"))
+
 
 if __name__ == "__main__":
     unittest.main()

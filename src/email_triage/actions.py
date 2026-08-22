@@ -12,12 +12,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
+from email_triage.folders import FOLDER_NAMES, TOPIC_CATEGORIES, URGENCY_CATEGORIES
 from email_triage.models import Confidence, ReviewRecord, Route
-from email_triage.pipeline import (
-    FOLDER_NAMES,
-    TOPIC_CATEGORIES,
-    URGENCY_CATEGORIES,
-)
 
 
 PROCESSING_CATEGORIES = ("AI - Processed", "AI - Processing Error")
@@ -83,6 +79,9 @@ def permitted_folders(record: ReviewRecord) -> tuple[str, ...]:
         or analysis.confidence == Confidence.LOW
         or record.processing_error
     ):
+        folder = record.target_folder
+        if folder.startswith("AI Triage/Needs Review"):
+            return (folder,)
         return (FOLDER_NAMES[Route.NEEDS_REVIEW],)
     return (record.target_folder,)
 

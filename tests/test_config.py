@@ -166,6 +166,19 @@ class ProviderSettingsTests(unittest.TestCase):
             with self.assertRaisesRegex(ConfigurationError, "between 0 and 2"):
                 Settings.from_env()
 
+    def test_reply_closing_is_read_from_the_environment(self) -> None:
+        environment = {
+            **self.BASE,
+            "TRIAGE_PROVIDER": "ollama",
+            "TRIAGE_REPLY_CLOSING": "Regards,\nAlex",
+        }
+        with patch.dict("os.environ", environment, clear=True):
+            settings = Settings.from_env()
+        self.assertEqual(settings.reply_closing, "Regards,\nAlex")
+        with patch.dict("os.environ", {**environment, "TRIAGE_REPLY_CLOSING": "<b>Nick</b>"}, clear=True):
+            with self.assertRaisesRegex(ConfigurationError, "HTML"):
+                Settings.from_env()
+
 
 if __name__ == "__main__":
     unittest.main()

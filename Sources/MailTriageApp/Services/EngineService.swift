@@ -52,6 +52,7 @@ struct EngineConfiguration: Equatable {
     var maxRetrievalPages: Int
     var outputDirectory: String
     var applyIdsFile: String = ""
+    var replyClosing: String = ReplyClosing.defaultValue
 
     /// True when no message text leaves this Mac for either role.
     var keepsDataOnThisMac: Bool {
@@ -62,6 +63,7 @@ struct EngineConfiguration: Equatable {
     var validationFailure: String? {
         if let failure = screening.validationFailure { return failure }
         if useAgent, let failure = agent.validationFailure { return failure }
+        if let failure = ReplyClosing.validationFailure(replyClosing) { return failure }
         if !keepsDataOnThisMac, !externalAIApproved {
             return """
                 A hosted AI provider is selected. Approve external AI in \
@@ -79,6 +81,13 @@ enum EngineCommandBuilder {
 
     static func liveProbe(_ configuration: EngineConfiguration) throws -> EngineCommand {
         try command(configuration, operation: ["--live-probe"])
+    }
+
+    static func ensureFolders(_ configuration: EngineConfiguration) throws -> EngineCommand {
+        guard configuration.source.supportsApply else {
+            throw EngineFailure.launchFailed("Folder creation needs Outlook on the Web or Graph.")
+        }
+        return try command(configuration, operation: ["--ensure-folders", "--non-interactive"])
     }
 
     static func triage(_ configuration: EngineConfiguration) throws -> EngineCommand {
@@ -177,6 +186,7 @@ enum EngineCommandBuilder {
         environment["MAX_RETRIEVAL_PAGES"] = String(configuration.maxRetrievalPages)
         environment["TRIAGE_OUTPUT_DIR"] = configuration.outputDirectory
         environment["TRIAGE_FEEDBACK_FILE"] = EnginePaths.learningPreferencesFile.path
+        environment["TRIAGE_REPLY_CLOSING"] = ReplyClosing.normalize(configuration.replyClosing)
         environment["EDGE_PROFILE_DIR"] = EnginePaths.edgeProfileDirectory.path
         environment["PYTHONUNBUFFERED"] = "1"
         return environment

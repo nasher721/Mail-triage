@@ -9,6 +9,7 @@ from typing import Any
 from email_triage.actions import PolicyViolation, plan_from_stored
 from email_triage.apply import ActionLog, Actuator, apply_plan
 from email_triage.config import ConfigurationError
+from email_triage.folders import ensure_organization_folders
 from email_triage.models import ReviewRecord
 from email_triage.pipeline import LocalQueue
 
@@ -125,6 +126,9 @@ def apply_selected(
     actuator: Actuator,
     mark_read: bool,
 ) -> tuple[int, int]:
+    mailbox = getattr(actuator, "mailbox", None)
+    if mailbox is not None:
+        ensure_organization_folders(mailbox)
     queue = LocalQueue(output_dir)
     payloads = queue.latest_payloads()
     action_log = ActionLog(output_dir)

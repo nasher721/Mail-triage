@@ -69,6 +69,21 @@ struct SettingsView: View {
                 }
             }
 
+            Section("Suggested reply") {
+                Text("Every unsent draft ends with this sign-off. Screening rejects replies that omit it.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                TextEditor(text: $store.replyClosing)
+                    .font(.body.monospaced())
+                    .frame(minHeight: 72)
+                    .onChange(of: store.replyClosing) { _, _ in store.persistSettings() }
+                if let failure = ReplyClosing.validationFailure(store.replyClosing) {
+                    Text(failure)
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+            }
+
             Section("Processing") {
                 Stepper("Maximum messages: \(store.maxMessages)", value: $store.maxMessages, in: 1...200)
                 HStack {
