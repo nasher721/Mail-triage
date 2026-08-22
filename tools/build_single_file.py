@@ -17,7 +17,7 @@ import sys
 from pathlib import Path
 
 
-_PATCH_TARGET_RE = re.compile(r'"email_triage\.[a-z_]+\.([A-Za-z_0-9]+)"')
+_PATCH_TARGET_RE = re.compile(r'"email_triage\.[a-z_]+\.([^"]+)"')
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -43,6 +43,7 @@ MODULE_ORDER = (
     "owa",
     "local_mailbox",
     "apply",
+    "selected",
     "runtime",
     "live_probe",
     "cli",
@@ -64,6 +65,7 @@ TEST_ORDER = (
     "test_actions",
     "test_agent",
     "test_apply",
+    "test_selected",
     "test_runtime",
     "test_cli",
     "test_live_probe",

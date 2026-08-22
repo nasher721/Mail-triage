@@ -1,9 +1,13 @@
+import json
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from email_triage.cli import _diagnostic_report, build_parser, main
+from email_triage.actions import default_plan
+from email_triage.apply import DryRunActuator, apply_plan
+from email_triage.cli import _diagnostic_report, build_parser, main, queue_preview_payload, run
 from email_triage.config import ConfigurationError
+from test_actions import needs_reply_record
 
 
 class DiagnosticCliTests(unittest.TestCase):
@@ -60,7 +64,6 @@ class ApplyIdsCliTests(unittest.TestCase):
             settings.apply_changes = True
             settings.mark_read = False
             settings.output_dir = Path("/tmp")
-            from email_triage.cli import run
             code = run(args)
         self.assertEqual(code, 0)
         load_ids.assert_called_once()
@@ -75,8 +78,21 @@ class ApplyIdsCliTests(unittest.TestCase):
         )
         with patch.dict("os.environ", {"TRIAGE_PROVIDER": "ollama"}, clear=False):
             with self.assertRaises(ConfigurationError):
-                from email_triage.cli import run
                 run(args)
+
+
+class PreviewQueueTests(unittest.TestCase):
+    def test_queue_preview_payload_includes_plan(self) -> None:
+        record = needs_reply_record()
+        plan = default_plan(record, False)
+        applied = apply_plan(record, plan, DryRunActuator())
+        payload = queue_preview_payload(record, plan, "deterministic", applied)
+        self.assertEqual(payload["plan_source"], "deterministic")
+        self.assertTrue(payload["planned_actions"])
+        kinds = [action["kind"] for action in payload["planned_actions"]]
+        self.assertIn("tag_message", kinds)
+        self.assertEqual(payload["actions"][0]["status"], "planned")
+        self.assertNotIn("Tuesday afternoon", json.dumps(payload["planned_actions"]))
 
 
 if __name__ == "__main__":

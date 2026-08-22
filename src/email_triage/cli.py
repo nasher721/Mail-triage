@@ -29,6 +29,14 @@ from email_triage.runtime import LockBusy, is_interactive, load_env_file, single
 from email_triage.selected import apply_selected, load_apply_ids
 
 
+def queue_preview_payload(record, plan, plan_source, applied) -> dict[str, object]:
+    payload = record.to_dict()
+    payload["plan_source"] = plan_source
+    payload["planned_actions"] = [action.to_dict() for action in plan]
+    payload["actions"] = [item.to_dict() for item in applied]
+    return payload
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -438,19 +446,23 @@ def run(args: argparse.Namespace) -> int:
         if record is None:
             skipped += 1
             continue
-        queue.append(record)
 
         plan, plan_source = agent.plan(record, settings.mark_read)
         if not plan:
             plan, plan_source = default_plan(record, settings.mark_read), "deterministic"
         applied = apply_plan(record, plan, actuator)
         action_log.append(record, plan_source, actuator.mode, applied)
+        payload = queue_preview_payload(record, plan, plan_source, applied)
+        queue.append(
+            record,
+            extra={
+                "plan_source": payload["plan_source"],
+                "planned_actions": payload["planned_actions"],
+                "actions": payload["actions"],
+            },
+        )
         if any(item.status == "failed" for item in applied):
             failures += 1
-
-        payload = record.to_dict()
-        payload["plan_source"] = plan_source
-        payload["actions"] = [item.to_dict() for item in applied]
         print(json.dumps(payload, ensure_ascii=False))
         processed += 1
 

@@ -45,6 +45,7 @@ from dataclasses import dataclass, field, replace
 from dataclasses import dataclass, replace
 from dataclasses import replace
 from datetime import datetime
+from datetime import datetime, timezone
 from email import policy
 from email.parser import BytesParser
 from email.utils import parsedate_to_datetime
@@ -61,7 +62,6 @@ from typing import Any, Iterable, Mapping, Sequence
 from typing import Any, Protocol
 from typing import Callable
 from typing import Iterator
-from typing import Protocol
 from unittest.mock import MagicMock, patch
 from unittest.mock import patch
 from urllib.error import HTTPError
@@ -268,6 +268,54 @@ class ReviewRecord:
 
     def to_dict(self) -> dict[str, Any]:
         return _json_safe(asdict(self))
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> "ReviewRecord":
+        if not isinstance(raw, dict):
+            raise ValueError("review record must be an object")
+        analysis_raw = raw.get("analysis")
+        if not isinstance(analysis_raw, dict):
+            raise ValueError("analysis must be an object")
+        received_raw = raw.get("received_at")
+        received_at: datetime | None
+        if received_raw in (None, ""):
+            received_at = None
+        elif isinstance(received_raw, datetime):
+            received_at = received_raw
+        elif isinstance(received_raw, str):
+            received_at = datetime.fromisoformat(received_raw)
+        else:
+            raise ValueError("received_at must be a string, datetime, or null")
+        categories = raw.get("categories") or ()
+        if not isinstance(categories, (list, tuple)) or not all(
+            isinstance(item, str) for item in categories
+        ):
+            raise ValueError("categories must be a list of strings")
+        internet_id = raw.get("internet_message_id")
+        if internet_id is not None and not isinstance(internet_id, str):
+            raise ValueError("internet_message_id must be a string or null")
+        message_id = str(raw.get("message_id") or "")
+        if not message_id:
+            raise ValueError("message_id is required")
+        return cls(
+            message_id=message_id,
+            internet_message_id=internet_id,
+            subject=str(raw.get("subject") or ""),
+            sender_name=str(raw.get("sender_name") or ""),
+            sender_address=str(raw.get("sender_address") or ""),
+            received_at=received_at,
+            sensitivity=str(raw.get("sensitivity") or "normal"),
+            has_attachments=bool(raw.get("has_attachments")),
+            target_folder=str(raw.get("target_folder") or ""),
+            categories=tuple(categories),
+            analysis=ScreeningResult.from_dict(analysis_raw),
+            unsubscribe_suggestion=bool(raw.get("unsubscribe_suggestion")),
+            processing_error=(
+                str(raw["processing_error"])
+                if raw.get("processing_error") is not None
+                else None
+            ),
+        )
 
 
 def _json_safe(value: Any) -> Any:
@@ -2601,10 +2649,13 @@ class LocalQueue:
 
         return set(self._seen)
 
-    def append(self, record: ReviewRecord) -> None:
+    def append(self, record: ReviewRecord, extra: dict[str, Any] | None = None) -> None:
         self._prepare()
+        payload = record.to_dict()
+        if extra:
+            payload.update(extra)
         with self.queue_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record.to_dict(), ensure_ascii=False) + "\n")
+            handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
         os.chmod(self.queue_path, 0o600)
         self._seen.add(record.message_id)
         self.state_path.write_text(
@@ -2612,6 +2663,28 @@ class LocalQueue:
             encoding="utf-8",
         )
         os.chmod(self.state_path, 0o600)
+
+    def latest_payloads(self) -> dict[str, dict[str, Any]]:
+        if not self.queue_path.is_file():
+            return {}
+        latest: dict[str, dict[str, Any]] = {}
+        try:
+            lines = self.queue_path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return {}
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            message_id = payload.get("message_id")
+            if isinstance(message_id, str) and message_id:
+                latest[message_id] = payload
+        return latest
 
 
 # -------------------------------------------------------------------------
@@ -2802,6 +2875,55 @@ def default_plan(record: ReviewRecord, allow_mark_read: bool) -> list[MailboxAct
     plan.append(MailboxAction(kind=ActionKind.FILE_MESSAGE, folder=record.target_folder))
     return normalize_plan(
         [validate_action(action, record, allow_mark_read) for action in plan]
+    )
+
+
+def _action_from_stored_item(item: dict[str, Any], record: ReviewRecord) -> MailboxAction:
+    if not isinstance(item, dict):
+        raise PolicyViolation("stored plan entries must be objects")
+    try:
+        kind = ActionKind(str(item.get("kind") or ""))
+    except ValueError as exc:
+        raise PolicyViolation(f"unsupported action {item.get('kind')!r}") from exc
+    if kind == ActionKind.FILE_MESSAGE:
+        folder = item.get("folder") or record.target_folder
+        if not isinstance(folder, str):
+            raise PolicyViolation("file_message requires a folder string")
+        return MailboxAction(kind=kind, folder=folder)
+    if kind == ActionKind.TAG_MESSAGE:
+        categories = item.get("categories") or record.categories
+        if isinstance(categories, str):
+            categories = [categories]
+        if not isinstance(categories, (list, tuple)) or not all(
+            isinstance(entry, str) for entry in categories
+        ):
+            raise PolicyViolation("tag_message requires a list of category strings")
+        return MailboxAction(kind=kind, categories=tuple(categories))
+    if kind == ActionKind.DRAFT_REPLY:
+        return MailboxAction(kind=kind, reply_body=record.analysis.suggested_reply)
+    if kind == ActionKind.MARK_READ:
+        return MailboxAction(kind=kind)
+    raise PolicyViolation(f"unsupported action {kind!r}")
+
+
+def plan_from_stored(
+    record: ReviewRecord,
+    payload: dict[str, Any],
+    allow_mark_read: bool,
+) -> list[MailboxAction]:
+    """Rebuild a plan from queue JSON. Reply text always comes from the record."""
+
+    planned = payload.get("planned_actions")
+    kinds_source: list[Any] | None = None
+    if isinstance(planned, list) and planned:
+        kinds_source = planned
+    elif isinstance(payload.get("actions"), list) and payload["actions"]:
+        kinds_source = payload["actions"]
+    if not kinds_source:
+        return default_plan(record, allow_mark_read)
+    rebuilt = [_action_from_stored_item(item, record) for item in kinds_source]
+    return normalize_plan(
+        [validate_action(action, record, allow_mark_read) for action in rebuilt]
     )
 
 
@@ -4108,6 +4230,115 @@ class ActionLog:
 
 
 # -------------------------------------------------------------------------
+# email_triage/selected.py
+# -------------------------------------------------------------------------
+
+"""Apply previously screened messages by ID without re-reading the mailbox."""
+
+
+
+
+MAX_APPLY_IDS = 200
+
+
+def load_apply_ids(path: Path) -> tuple[str, ...]:
+    if not path.is_file():
+        raise ConfigurationError(f"apply IDs file not found: {path}")
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ConfigurationError("apply IDs file must be JSON") from exc
+    if not isinstance(raw, dict):
+        raise ConfigurationError("apply IDs file must be an object")
+    values = raw.get("message_ids")
+    if not isinstance(values, list) or not values:
+        raise ConfigurationError("message_ids must be a non-empty list")
+    if len(values) > MAX_APPLY_IDS:
+        raise ConfigurationError(f"message_ids cannot exceed {MAX_APPLY_IDS} entries")
+    ids = tuple(str(item) for item in values if isinstance(item, str) and item)
+    if len(ids) != len(values):
+        raise ConfigurationError("message_ids must contain only non-empty strings")
+    return ids
+
+
+def apply_selected(
+    *,
+    output_dir: Path,
+    ids: tuple[str, ...],
+    actuator: Actuator,
+    mark_read: bool,
+) -> tuple[int, int]:
+    queue = LocalQueue(output_dir)
+    payloads = queue.latest_payloads()
+    action_log = ActionLog(output_dir)
+    failures = 0
+    emitted = 0
+    for message_id in ids:
+        payload = payloads.get(message_id)
+        if payload is None:
+            failures += 1
+            emitted += 1
+            print(
+                json.dumps(
+                    {
+                        "message_id": message_id,
+                        "plan_source": "stored",
+                        "actions": [
+                            {
+                                "kind": "file_message",
+                                "description": "apply stored plan",
+                                "status": "failed",
+                                "detail": "message was not in the review queue",
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            continue
+        try:
+            record = ReviewRecord.from_dict(payload)
+            plan = plan_from_stored(record, payload, mark_read)
+        except (ValueError, PolicyViolation) as exc:
+            failures += 1
+            emitted += 1
+            print(
+                json.dumps(
+                    {
+                        **{key: payload.get(key) for key in ("message_id", "subject", "sender_address", "target_folder")},
+                        "plan_source": payload.get("plan_source") or "stored",
+                        "actions": [
+                            {
+                                "kind": "file_message",
+                                "description": "apply stored plan",
+                                "status": "failed",
+                                "detail": str(exc),
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            continue
+        applied = apply_plan(record, plan, actuator)
+        if any(item.status == "failed" for item in applied):
+            failures += 1
+        action_log.append(
+            record,
+            str(payload.get("plan_source") or "stored"),
+            getattr(actuator, "mode", "apply"),
+            applied,
+        )
+        line = record.to_dict()
+        line["plan_source"] = payload.get("plan_source") or "stored"
+        line["planned_actions"] = payload.get("planned_actions")
+        line["actions"] = [item.to_dict() for item in applied]
+        print(json.dumps(line, ensure_ascii=False))
+        emitted += 1
+    return emitted, failures
+
+
+# -------------------------------------------------------------------------
 # email_triage/runtime.py
 # -------------------------------------------------------------------------
 
@@ -4336,6 +4567,14 @@ def run_live_probe(source: str) -> LiveProbeResult:
 # email_triage/cli.py
 # -------------------------------------------------------------------------
 
+def queue_preview_payload(record, plan, plan_source, applied) -> dict[str, object]:
+    payload = record.to_dict()
+    payload["plan_source"] = plan_source
+    payload["planned_actions"] = [action.to_dict() for action in plan]
+    payload["actions"] = [item.to_dict() for item in applied]
+    return payload
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -4436,6 +4675,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Write to the mailbox: move messages into AI Triage folders, apply categories, "
             "and save unsent reply drafts. Without this flag the plan is only previewed."
+        ),
+    )
+    parser.add_argument(
+        "--apply-ids-file",
+        help=(
+            "JSON file {\"message_ids\": [...]} of already-screened message IDs to apply. "
+            "Requires --apply. Does not re-read unread mail or call a model. "
+            "Valid only with --source owa or graph."
         ),
     )
     parser.add_argument(
@@ -4605,6 +4852,33 @@ def run(args: argparse.Namespace) -> int:
         )
         return 0
 
+    if args.apply_ids_file:
+        if settings.mailbox_source not in {"owa", "graph"}:
+            raise ConfigurationError("--apply-ids-file supports only --source owa or graph")
+        if not settings.apply_changes:
+            raise ConfigurationError("--apply-ids-file requires --apply")
+        ids = load_apply_ids(Path(args.apply_ids_file).expanduser())
+        if settings.mailbox_source == "owa":
+            mailbox = OwaMailbox(
+                settings.owa_cdp_url,
+                read_write=True,
+                max_scan_pages=settings.max_retrieval_pages,
+            )
+        else:
+            mailbox = _build_graph_mailbox(settings, interactive)
+        actuator = GraphActuator(mailbox)
+        _emitted, failures = apply_selected(
+            output_dir=settings.output_dir,
+            ids=ids,
+            actuator=actuator,
+            mark_read=settings.mark_read,
+        )
+        print(
+            "Mailbox updated for selected messages; no mail was sent, forwarded, or deleted.",
+            file=sys.stderr,
+        )
+        return 1 if failures else 0
+
     live_mailbox: GraphMailbox | OwaMailbox | None = None
     if settings.mailbox_source == "local":
         if settings.input_path is None:
@@ -4710,19 +4984,23 @@ def run(args: argparse.Namespace) -> int:
         if record is None:
             skipped += 1
             continue
-        queue.append(record)
 
         plan, plan_source = agent.plan(record, settings.mark_read)
         if not plan:
             plan, plan_source = default_plan(record, settings.mark_read), "deterministic"
         applied = apply_plan(record, plan, actuator)
         action_log.append(record, plan_source, actuator.mode, applied)
+        payload = queue_preview_payload(record, plan, plan_source, applied)
+        queue.append(
+            record,
+            extra={
+                "plan_source": payload["plan_source"],
+                "planned_actions": payload["planned_actions"],
+                "actions": payload["actions"],
+            },
+        )
         if any(item.status == "failed" for item in applied):
             failures += 1
-
-        payload = record.to_dict()
-        payload["plan_source"] = plan_source
-        payload["actions"] = [item.to_dict() for item in applied]
         print(json.dumps(payload, ensure_ascii=False))
         processed += 1
 
@@ -4799,6 +5077,13 @@ def _cli_main(argv: list[str] | None = None) -> int:
             agent_provider=args.agent_provider,
             agent_model=args.agent_model,
         )
+        if getattr(args, "apply_ids_file", None):
+            if not args.apply:
+                raise ConfigurationError("--apply-ids-file requires --apply")
+            if watch_seconds is not None:
+                raise ConfigurationError(
+                    "--apply-ids-file cannot be combined with --watch"
+                )
         while True:
             try:
                 with single_instance_lock(output_dir / "triage.lock"):
@@ -4862,6 +5147,49 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(result.confidence, Confidence.HIGH)
         self.assertEqual(result.urgency, Urgency.ROUTINE)
         self.assertEqual(result.topic, Topic.ADMINISTRATIVE)
+
+
+class ReviewRecordRoundTripTests(unittest.TestCase):
+    def test_from_dict_reloads_to_dict_payload(self) -> None:
+        record = ReviewRecord(
+            message_id="message-1",
+            internet_message_id="<1@example.org>",
+            subject="Meeting",
+            sender_name="Alex",
+            sender_address="alex@example.org",
+            received_at=datetime(2026, 8, 22, 12, 0, tzinfo=timezone.utc),
+            sensitivity="normal",
+            has_attachments=False,
+            target_folder="AI Triage/Needs Reply",
+            categories=("AI - Soon", "AI - Scheduling", "AI - Processed"),
+            analysis=ScreeningResult(
+                summary="A colleague asks to schedule a meeting.",
+                priority_score=3,
+                action_items=("Confirm availability.",),
+                route=Route.NEEDS_REPLY,
+                response_required=True,
+                confidence=Confidence.HIGH,
+                urgency=Urgency.SOON,
+                deadline="next Tuesday",
+                topic=Topic.SCHEDULING,
+                manual_review_reason=None,
+                rationale="Direct scheduling request.",
+                suggested_reply="Thanks.\n\nBest,\nNick",
+            ),
+            unsubscribe_suggestion=False,
+            processing_error=None,
+        )
+        loaded = ReviewRecord.from_dict(record.to_dict())
+        self.assertEqual(loaded.message_id, "message-1")
+        self.assertEqual(loaded.target_folder, "AI Triage/Needs Reply")
+        self.assertEqual(loaded.analysis.route, Route.NEEDS_REPLY)
+        self.assertEqual(loaded.analysis.suggested_reply, "Thanks.\n\nBest,\nNick")
+        self.assertEqual(loaded.categories, ("AI - Soon", "AI - Scheduling", "AI - Processed"))
+        self.assertEqual(loaded.received_at, record.received_at)
+
+    def test_from_dict_rejects_non_object(self) -> None:
+        with self.assertRaises(ValueError):
+            ReviewRecord.from_dict([])  # type: ignore[arg-type]
 
 
 # -------------------------------------------------------------------------
@@ -6460,6 +6788,25 @@ class PipelineTests(unittest.TestCase):
             )
 
 
+class QueuePayloadTests(PipelineTests):
+    def test_append_extra_fields_and_latest_wins(self) -> None:
+        record = process_message(self.message(), FakeClassifier(), 12_000)
+        with tempfile.TemporaryDirectory() as directory:
+            queue = LocalQueue(Path(directory))
+            queue.append(record, extra={"plan_source": "agent", "actions": []})
+            queue.append(record, extra={"plan_source": "deterministic", "actions": [{"kind": "file_message"}]})
+            (Path(directory) / "review_queue.jsonl").write_text(
+                (Path(directory) / "review_queue.jsonl").read_text(encoding="utf-8")
+                + "not-json\n",
+                encoding="utf-8",
+            )
+            payloads = queue.latest_payloads()
+        self.assertEqual(set(payloads), {"message-1"})
+        self.assertEqual(payloads["message-1"]["plan_source"], "deterministic")
+        self.assertEqual(payloads["message-1"]["actions"][0]["kind"], "file_message")
+        self.assertNotIn("Can we meet", json.dumps(payloads["message-1"]))
+
+
 # -------------------------------------------------------------------------
 # tests/test_actions.py
 # -------------------------------------------------------------------------
@@ -6649,6 +6996,36 @@ class PolicyTests(unittest.TestCase):
             [ActionKind.TAG_MESSAGE, ActionKind.FILE_MESSAGE],
         )
         self.assertEqual(plan[1].folder, "AI Triage/Needs Review")
+
+
+class StoredPlanTests(unittest.TestCase):
+    def test_planned_actions_use_suggested_reply_not_stored_text(self) -> None:
+        record = needs_reply_record()
+        payload = {
+            "planned_actions": [
+                {"kind": "tag_message", "folder": None, "categories": list(record.categories), "drafts_reply": False},
+                {"kind": "draft_reply", "folder": None, "categories": [], "drafts_reply": True},
+                {"kind": "file_message", "folder": "AI Triage/Needs Reply", "categories": [], "drafts_reply": False},
+            ]
+        }
+        plan = plan_from_stored(record, payload, allow_mark_read=False)
+        draft = next(action for action in plan if action.kind == ActionKind.DRAFT_REPLY)
+        self.assertEqual(draft.reply_body, REPLY_TEXT)
+
+    def test_tampered_folder_is_rejected(self) -> None:
+        record = needs_reply_record()
+        payload = {
+            "planned_actions": [
+                {"kind": "file_message", "folder": "Inbox", "categories": [], "drafts_reply": False},
+            ]
+        }
+        with self.assertRaises(PolicyViolation):
+            plan_from_stored(record, payload, allow_mark_read=False)
+
+    def test_missing_plan_uses_default_plan(self) -> None:
+        record = needs_reply_record()
+        plan = plan_from_stored(record, {}, allow_mark_read=False)
+        self.assertEqual([action.kind for action in plan], [action.kind for action in default_plan(record, False)])
 
 
 # -------------------------------------------------------------------------
@@ -6909,6 +7286,118 @@ class ApplyTests(unittest.TestCase):
 
 
 # -------------------------------------------------------------------------
+# tests/test_selected.py
+# -------------------------------------------------------------------------
+
+class LoadApplyIdsTests(unittest.TestCase):
+    def test_loads_owner_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ids.json"
+            path.write_text('{"message_ids": ["a", "b"]}\n', encoding="utf-8")
+            self.assertEqual(load_apply_ids(path), ("a", "b"))
+
+    def test_empty_or_too_many_or_malformed_fail(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ids.json"
+            path.write_text('{"message_ids": []}\n', encoding="utf-8")
+            with self.assertRaises(ConfigurationError):
+                load_apply_ids(path)
+            path.write_text('{"message_ids": %s}\n' % json.dumps(["x"] * (MAX_APPLY_IDS + 1)), encoding="utf-8")
+            with self.assertRaises(ConfigurationError):
+                load_apply_ids(path)
+            path.write_text("[]\n", encoding="utf-8")
+            with self.assertRaises(ConfigurationError):
+                load_apply_ids(path)
+            with self.assertRaises(ConfigurationError):
+                load_apply_ids(Path(directory) / "missing.json")
+
+
+class ApplySelectedTests(unittest.TestCase):
+    def test_actuates_only_listed_ids_without_classifier(self) -> None:
+        first = needs_reply_record()
+        second = replace(needs_reply_record(), message_id="message-2")
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            queue = LocalQueue(output)
+            for record in (first, second):
+                extra = {
+                    "plan_source": "deterministic",
+                    "planned_actions": [action.to_dict() for action in default_plan(record, False)],
+                    "actions": [],
+                }
+                queue.append(record, extra=extra)
+            mailbox = FakeGraphMailbox()
+            emitted, failures = apply_selected(
+                output_dir=output,
+                ids=("message-1",),
+                actuator=GraphActuator(mailbox),
+                mark_read=False,
+            )
+        self.assertEqual((emitted, failures), (1, 0))
+        self.assertTrue(any(call[0] == "move_message" for call in mailbox.calls))
+        moved_ids = [call[1] for call in mailbox.calls if call[0] == "move_message"]
+        self.assertEqual(moved_ids, ["message-1"])
+
+    def test_missing_id_fails_and_continues(self) -> None:
+        record = needs_reply_record()
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            LocalQueue(output).append(
+                record,
+                extra={
+                    "plan_source": "deterministic",
+                    "planned_actions": [action.to_dict() for action in default_plan(record, False)],
+                },
+            )
+            mailbox = FakeGraphMailbox()
+            emitted, failures = apply_selected(
+                output_dir=output,
+                ids=("message-1", "missing"),
+                actuator=GraphActuator(mailbox),
+                mark_read=False,
+            )
+        self.assertEqual(emitted, 2)
+        self.assertEqual(failures, 1)
+
+    def test_mailbox_404_fails_that_row(self) -> None:
+        record = needs_reply_record()
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            LocalQueue(output).append(
+                record,
+                extra={
+                    "plan_source": "deterministic",
+                    "planned_actions": [action.to_dict() for action in default_plan(record, False)],
+                },
+            )
+            mailbox = FakeGraphMailbox(fail_on="ensure_folder_path")
+            emitted, failures = apply_selected(
+                output_dir=output,
+                ids=("message-1",),
+                actuator=GraphActuator(mailbox),
+                mark_read=False,
+            )
+        self.assertEqual((emitted, failures), (1, 1))
+
+    def test_does_not_rewrite_review_queue(self) -> None:
+        record = needs_reply_record()
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            queue = LocalQueue(output)
+            queue.append(record, extra={"plan_source": "deterministic"})
+            before = queue.queue_path.read_text(encoding="utf-8")
+            apply_selected(
+                output_dir=output,
+                ids=("message-1",),
+                actuator=GraphActuator(FakeGraphMailbox()),
+                mark_read=False,
+            )
+            self.assertEqual(queue.queue_path.read_text(encoding="utf-8"), before)
+            self.assertTrue((output / "applied_actions.jsonl").is_file())
+            self.assertEqual(S_IMODE((output / "applied_actions.jsonl").stat().st_mode), 0o600)
+
+
+# -------------------------------------------------------------------------
 # tests/test_runtime.py
 # -------------------------------------------------------------------------
 
@@ -7037,6 +7526,66 @@ class DiagnosticCliTests(unittest.TestCase):
             report = _diagnostic_report(args)
         self.assertEqual(report["capabilities"]["source"], "owa")
         self.assertEqual(report["readiness"]["code"], "cdp_unreachable")
+
+
+class ApplyIdsCliTests(unittest.TestCase):
+    def test_parser_accepts_apply_ids_file(self) -> None:
+        args = build_parser().parse_args(
+            ["--source", "owa", "--apply", "--apply-ids-file", "/tmp/ids.json"]
+        )
+        self.assertEqual(args.apply_ids_file, "/tmp/ids.json")
+        self.assertTrue(args.apply)
+
+    def test_watch_and_ids_file_are_rejected(self) -> None:
+        with patch("sys.argv", ["email-triage", "--owa", "--apply", "--apply-ids-file", "x", "--watch", "30"]):
+            self.assertEqual(main(), 2)
+
+    def test_apply_ids_skips_classifier_and_unread_scan(self) -> None:
+        args = build_parser().parse_args(
+            ["--source", "graph", "--apply", "--apply-ids-file", "/tmp/ids.json", "--non-interactive"]
+        )
+        with (
+            patch(__name__ + ".Settings.from_env") as settings_from_env,
+            patch(__name__ + ".load_apply_ids", return_value=("message-1",)) as load_ids,
+            patch(__name__ + ".apply_selected", return_value=(1, 0)) as apply_sel,
+            patch(__name__ + ".build_classifier") as build_classifier,
+            patch(__name__ + "._build_graph_mailbox") as build_mailbox,
+            patch(__name__ + ".GraphActuator") as actuator_cls,
+        ):
+            settings = settings_from_env.return_value
+            settings.mailbox_source = "graph"
+            settings.apply_changes = True
+            settings.mark_read = False
+            settings.output_dir = Path("/tmp")
+            code = run(args)
+        self.assertEqual(code, 0)
+        load_ids.assert_called_once()
+        apply_sel.assert_called_once()
+        build_classifier.assert_not_called()
+        build_mailbox.assert_called_once()
+        actuator_cls.assert_called_once()
+
+    def test_apply_ids_rejects_local_source(self) -> None:
+        args = build_parser().parse_args(
+            ["--source", "local", "--input", "samples/inbox.jsonl", "--apply", "--apply-ids-file", "/tmp/ids.json"]
+        )
+        with patch.dict("os.environ", {"TRIAGE_PROVIDER": "ollama"}, clear=False):
+            with self.assertRaises(ConfigurationError):
+                run(args)
+
+
+class PreviewQueueTests(unittest.TestCase):
+    def test_queue_preview_payload_includes_plan(self) -> None:
+        record = needs_reply_record()
+        plan = default_plan(record, False)
+        applied = apply_plan(record, plan, DryRunActuator())
+        payload = queue_preview_payload(record, plan, "deterministic", applied)
+        self.assertEqual(payload["plan_source"], "deterministic")
+        self.assertTrue(payload["planned_actions"])
+        kinds = [action["kind"] for action in payload["planned_actions"]]
+        self.assertIn("tag_message", kinds)
+        self.assertEqual(payload["actions"][0]["status"], "planned")
+        self.assertNotIn("Tuesday afternoon", json.dumps(payload["planned_actions"]))
 
 
 # -------------------------------------------------------------------------
