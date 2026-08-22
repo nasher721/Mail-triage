@@ -723,7 +723,9 @@ final class AppStore: ObservableObject {
                 let newRecords = try EngineParser.records(from: output.stdout)
                 if configuration.runMode == .apply {
                     self.results = ApplySelection.merge(existing: self.results, applied: newRecords)
-                    self.selectedApplyIDs.subtract(self.results.filter(\.isApplied).map(\.messageID))
+                    var next = self.selectedApplyIDs
+                    next.subtract(self.results.filter(\.isApplied).map(\.messageID))
+                    self.selectedApplyIDs = next
                 } else {
                     self.results = newRecords
                     self.selectedApplyIDs = Set(newRecords.filter { !$0.isApplied }.map(\.messageID))

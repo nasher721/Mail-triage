@@ -139,11 +139,13 @@ private struct ResultRow: View {
                 isOn: Binding(
                     get: { store.selectedApplyIDs.contains(record.messageID) },
                     set: { isOn in
+                        var next = store.selectedApplyIDs
                         if isOn {
-                            store.selectedApplyIDs.insert(record.messageID)
+                            next.insert(record.messageID)
                         } else {
-                            store.selectedApplyIDs.remove(record.messageID)
+                            next.remove(record.messageID)
                         }
+                        store.selectedApplyIDs = next
                     }
                 )
             )

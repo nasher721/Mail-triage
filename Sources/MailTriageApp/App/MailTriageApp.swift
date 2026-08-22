@@ -57,7 +57,7 @@ struct MailTriageApp: App {
                     store.requestRun()
                 }
                 .keyboardShortcut("r", modifiers: [.command, .shift])
-                .disabled(!store.canRun || !store.source.supportsApply)
+                .disabled(!store.canApplySelection)
 
                 Button("Run Diagnostics") { store.runDiagnostic() }
                     .keyboardShortcut("d", modifiers: [.command, .shift])
