@@ -195,6 +195,54 @@ class ReviewRecord:
     def to_dict(self) -> dict[str, Any]:
         return _json_safe(asdict(self))
 
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> "ReviewRecord":
+        if not isinstance(raw, dict):
+            raise ValueError("review record must be an object")
+        analysis_raw = raw.get("analysis")
+        if not isinstance(analysis_raw, dict):
+            raise ValueError("analysis must be an object")
+        received_raw = raw.get("received_at")
+        received_at: datetime | None
+        if received_raw in (None, ""):
+            received_at = None
+        elif isinstance(received_raw, datetime):
+            received_at = received_raw
+        elif isinstance(received_raw, str):
+            received_at = datetime.fromisoformat(received_raw)
+        else:
+            raise ValueError("received_at must be a string, datetime, or null")
+        categories = raw.get("categories") or ()
+        if not isinstance(categories, (list, tuple)) or not all(
+            isinstance(item, str) for item in categories
+        ):
+            raise ValueError("categories must be a list of strings")
+        internet_id = raw.get("internet_message_id")
+        if internet_id is not None and not isinstance(internet_id, str):
+            raise ValueError("internet_message_id must be a string or null")
+        message_id = str(raw.get("message_id") or "")
+        if not message_id:
+            raise ValueError("message_id is required")
+        return cls(
+            message_id=message_id,
+            internet_message_id=internet_id,
+            subject=str(raw.get("subject") or ""),
+            sender_name=str(raw.get("sender_name") or ""),
+            sender_address=str(raw.get("sender_address") or ""),
+            received_at=received_at,
+            sensitivity=str(raw.get("sensitivity") or "normal"),
+            has_attachments=bool(raw.get("has_attachments")),
+            target_folder=str(raw.get("target_folder") or ""),
+            categories=tuple(categories),
+            analysis=ScreeningResult.from_dict(analysis_raw),
+            unsubscribe_suggestion=bool(raw.get("unsubscribe_suggestion")),
+            processing_error=(
+                str(raw["processing_error"])
+                if raw.get("processing_error") is not None
+                else None
+            ),
+        )
+
 
 def _json_safe(value: Any) -> Any:
     if isinstance(value, dict):
