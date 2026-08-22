@@ -51,6 +51,7 @@ struct EngineConfiguration: Equatable {
     var maxBodyCharacters: Int
     var maxRetrievalPages: Int
     var outputDirectory: String
+    var applyIdsFile: String = ""
 
     /// True when no message text leaves this Mac for either role.
     var keepsDataOnThisMac: Bool {
@@ -86,7 +87,12 @@ enum EngineCommandBuilder {
             guard configuration.source.supportsApply else {
                 throw EngineFailure.launchFailed("The selected source is preview-only.")
             }
+            let idsFile = configuration.applyIdsFile.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !idsFile.isEmpty else {
+                throw EngineFailure.launchFailed("Select at least one previewed message to apply.")
+            }
             operation.append("--apply")
+            operation.append(contentsOf: ["--apply-ids-file", idsFile])
         }
         if configuration.markRead { operation.append("--mark-read") }
         if !configuration.useAgent { operation.append("--no-agent") }

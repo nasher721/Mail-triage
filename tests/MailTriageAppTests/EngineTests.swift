@@ -20,8 +20,16 @@ private var configuration: EngineConfiguration {
         maxMessages: 20,
         maxBodyCharacters: 12_000,
         maxRetrievalPages: 10,
-        outputDirectory: "/tmp/mail-triage-tests"
+        outputDirectory: "/tmp/mail-triage-tests",
+        applyIdsFile: ""
     )
+}
+
+private func record(id: String, status: String) throws -> TriageRecord {
+    let line = """
+    {"message_id":"\(id)","subject":"Quarterly update","sender_name":"Alex","sender_address":"alex@example.org","target_folder":"AI Triage/Needs Reply","categories":["AI Triage"],"analysis":{"route":"needs_reply","urgency":"soon","topic":"administrative","confidence":"high","priority_score":4,"summary":"Needs a response.","action_items":["Reply"],"suggested_reply":"Thanks\\n\\nBest,\\nNick","manual_review_reason":null,"deadline":null},"plan_source":"agent","actions":[{"kind":"file_message","description":"move","status":"\(status)","detail":null}]}
+    """
+    return try EngineParser.records(from: line)[0]
 }
 
 private func hosted(
@@ -47,12 +55,52 @@ private func hosted(
     #expect(!command.arguments.contains("--apply"))
 }
 
-@Test func applyCommandIsExplicitAndRejectedForPreviewOnlySource() throws {
+@Test func appliedRecordsAreDetectedFromActionStatus() throws {
+    #expect(try record(id: "m1", status: "planned").isApplied == false)
+    #expect(try record(id: "m2", status: "applied").isApplied == true)
+}
+
+@Test func applySelectionHonorsFilterAndSkipsApplied() throws {
+    let planned = try record(id: "a", status: "planned")
+    let applied = try record(id: "b", status: "applied")
+    let hidden = try record(id: "c", status: "planned")
+    var selected: Set<String> = ["c"]
+    selected = ApplySelection.selectAllFiltered(current: selected, filtered: [planned, applied])
+    #expect(selected == ["a", "c"])
+    selected = ApplySelection.selectNoneFiltered(current: selected, filtered: [planned, applied])
+    #expect(selected == ["c"])
+    #expect(ApplySelection.idsForApply(selected: ["a", "b", "c"], records: [planned, applied, hidden]) == ["a", "c"])
+}
+
+@Test func applyMergesByMessageIDWithoutDroppingRows() throws {
+    let existing = [try record(id: "a", status: "planned"), try record(id: "b", status: "planned")]
+    let applied = [try record(id: "a", status: "applied")]
+    let merged = ApplySelection.merge(existing: existing, applied: applied)
+    #expect(merged.count == 2)
+    #expect(merged[0].isApplied)
+    #expect(!merged[1].isApplied)
+}
+
+@Test func applyIdsJSONUsesSnakeCaseMessageIds() throws {
+    let data = try ApplySelection.jsonDocument(messageIDs: ["m1", "m2"])
+    let object = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+    #expect(object?["message_ids"] as? [String] == ["m1", "m2"])
+}
+
+@Test func applyCommandRequiresIdsFileAndForwardsPathLiterally() throws {
     var apply = configuration
     apply.runMode = .apply
-    #expect(try EngineCommandBuilder.triage(apply).arguments.contains("--apply"))
+    #expect(throws: EngineFailure.self) {
+        try EngineCommandBuilder.triage(apply)
+    }
+    apply.applyIdsFile = "/tmp/mail-triage/apply-ids.json"
+    let command = try EngineCommandBuilder.triage(apply)
+    #expect(command.arguments.contains("--apply"))
+    #expect(command.arguments.contains("--apply-ids-file"))
+    #expect(command.arguments.contains("/tmp/mail-triage/apply-ids.json"))
 
     apply.source = .accessibility
+    apply.applyIdsFile = "/tmp/x.json"
     #expect(throws: EngineFailure.self) {
         try EngineCommandBuilder.triage(apply)
     }

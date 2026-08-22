@@ -167,6 +167,10 @@ struct TriageRecord: Codable, Identifiable, Equatable {
 
         var id: String { "\(kind)-\(status)-\(detail ?? "")" }
     }
+
+    var isApplied: Bool {
+        actions.contains { $0.status == "applied" }
+    }
 }
 
 struct ActivityEntry: Identifiable, Equatable {
