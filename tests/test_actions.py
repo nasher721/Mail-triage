@@ -9,6 +9,7 @@ from email_triage.actions import (
     default_plan,
     normalize_plan,
     permitted_folders,
+    plan_from_stored,
     validate_action,
 )
 from email_triage.models import (
@@ -207,6 +208,36 @@ class PolicyTests(unittest.TestCase):
             [ActionKind.TAG_MESSAGE, ActionKind.FILE_MESSAGE],
         )
         self.assertEqual(plan[1].folder, "AI Triage/Needs Review")
+
+
+class StoredPlanTests(unittest.TestCase):
+    def test_planned_actions_use_suggested_reply_not_stored_text(self) -> None:
+        record = needs_reply_record()
+        payload = {
+            "planned_actions": [
+                {"kind": "tag_message", "folder": None, "categories": list(record.categories), "drafts_reply": False},
+                {"kind": "draft_reply", "folder": None, "categories": [], "drafts_reply": True},
+                {"kind": "file_message", "folder": "AI Triage/Needs Reply", "categories": [], "drafts_reply": False},
+            ]
+        }
+        plan = plan_from_stored(record, payload, allow_mark_read=False)
+        draft = next(action for action in plan if action.kind == ActionKind.DRAFT_REPLY)
+        self.assertEqual(draft.reply_body, REPLY_TEXT)
+
+    def test_tampered_folder_is_rejected(self) -> None:
+        record = needs_reply_record()
+        payload = {
+            "planned_actions": [
+                {"kind": "file_message", "folder": "Inbox", "categories": [], "drafts_reply": False},
+            ]
+        }
+        with self.assertRaises(PolicyViolation):
+            plan_from_stored(record, payload, allow_mark_read=False)
+
+    def test_missing_plan_uses_default_plan(self) -> None:
+        record = needs_reply_record()
+        plan = plan_from_stored(record, {}, allow_mark_read=False)
+        self.assertEqual([action.kind for action in plan], [action.kind for action in default_plan(record, False)])
 
 
 if __name__ == "__main__":

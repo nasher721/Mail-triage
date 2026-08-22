@@ -193,3 +193,52 @@ def default_plan(record: ReviewRecord, allow_mark_read: bool) -> list[MailboxAct
     return normalize_plan(
         [validate_action(action, record, allow_mark_read) for action in plan]
     )
+
+
+def _action_from_stored_item(item: dict[str, Any], record: ReviewRecord) -> MailboxAction:
+    if not isinstance(item, dict):
+        raise PolicyViolation("stored plan entries must be objects")
+    try:
+        kind = ActionKind(str(item.get("kind") or ""))
+    except ValueError as exc:
+        raise PolicyViolation(f"unsupported action {item.get('kind')!r}") from exc
+    if kind == ActionKind.FILE_MESSAGE:
+        folder = item.get("folder") or record.target_folder
+        if not isinstance(folder, str):
+            raise PolicyViolation("file_message requires a folder string")
+        return MailboxAction(kind=kind, folder=folder)
+    if kind == ActionKind.TAG_MESSAGE:
+        categories = item.get("categories") or record.categories
+        if isinstance(categories, str):
+            categories = [categories]
+        if not isinstance(categories, (list, tuple)) or not all(
+            isinstance(entry, str) for entry in categories
+        ):
+            raise PolicyViolation("tag_message requires a list of category strings")
+        return MailboxAction(kind=kind, categories=tuple(categories))
+    if kind == ActionKind.DRAFT_REPLY:
+        return MailboxAction(kind=kind, reply_body=record.analysis.suggested_reply)
+    if kind == ActionKind.MARK_READ:
+        return MailboxAction(kind=kind)
+    raise PolicyViolation(f"unsupported action {kind!r}")
+
+
+def plan_from_stored(
+    record: ReviewRecord,
+    payload: dict[str, Any],
+    allow_mark_read: bool,
+) -> list[MailboxAction]:
+    """Rebuild a plan from queue JSON. Reply text always comes from the record."""
+
+    planned = payload.get("planned_actions")
+    kinds_source: list[Any] | None = None
+    if isinstance(planned, list) and planned:
+        kinds_source = planned
+    elif isinstance(payload.get("actions"), list) and payload["actions"]:
+        kinds_source = payload["actions"]
+    if not kinds_source:
+        return default_plan(record, allow_mark_read)
+    rebuilt = [_action_from_stored_item(item, record) for item in kinds_source]
+    return normalize_plan(
+        [validate_action(action, record, allow_mark_read) for action in rebuilt]
+    )
